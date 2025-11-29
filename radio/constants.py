@@ -4,9 +4,16 @@ import os
 from typing import Final
 
 # Directory paths (expands ~ to full home directory path)
-REGULAR_MUSIC_PATH: Final[str] = os.path.expanduser('~/source/appalachia-radio/songs')
-HOLIDAY_MUSIC_PATH: Final[str] = os.path.expanduser('~/source/appalachia-radio/holiday_songs')
-DJ_PATH: Final[str] = os.path.expanduser('~/source/appalachia-radio/julie')
+# These can be configured via environment variables, with defaults shown below
+REGULAR_MUSIC_PATH: Final[str] = os.path.expanduser(
+    os.environ.get('REGULAR_MUSIC_PATH', '~/source/appalachia-radio/songs')
+)
+HOLIDAY_MUSIC_PATH: Final[str] = os.path.expanduser(
+    os.environ.get('HOLIDAY_MUSIC_PATH', '~/source/appalachia-radio/holiday_songs')
+)
+DJ_PATH: Final[str] = os.path.expanduser(
+    os.environ.get('DJ_PATH', '~/source/appalachia-radio/julie')
+)
 
 # DJ file limits
 MAX_INTRO_FILES: Final[int] = 5

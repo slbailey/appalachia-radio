@@ -32,6 +32,24 @@ This guide will help you set up Appalachia Radio to run automatically on boot on
 
 Edit `radio/constants.py` to set your music directories:
 
+**Option 1: Via `.env` file (recommended):**
+
+Add to your `.env` file:
+```bash
+REGULAR_MUSIC_PATH=~/source/appalachia-radio/songs
+HOLIDAY_MUSIC_PATH=~/source/appalachia-radio/holiday_songs
+DJ_PATH=~/source/appalachia-radio/julie
+```
+
+Or use absolute paths:
+```bash
+REGULAR_MUSIC_PATH=/home/pi/music/songs
+HOLIDAY_MUSIC_PATH=/home/pi/music/holiday_songs
+DJ_PATH=/home/pi/music/julie
+```
+
+**Option 2: Edit `radio/constants.py` directly:**
+
 ```python
 REGULAR_MUSIC_PATH = os.path.expanduser('~/radio/songs')
 HOLIDAY_MUSIC_PATH = os.path.expanduser('~/radio/holiday_songs')
@@ -44,6 +62,8 @@ REGULAR_MUSIC_PATH = '/home/pi/music/songs'
 HOLIDAY_MUSIC_PATH = '/home/pi/music/holiday_songs'
 DJ_PATH = '/home/pi/music/julie'
 ```
+
+Paths can use `~` for home directory expansion. If not set in `.env`, defaults are used.
 
 ## Step 3: Test the Application
 

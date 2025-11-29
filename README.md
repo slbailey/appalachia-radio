@@ -29,13 +29,25 @@ An intelligent music player with smart playlist management, holiday season aware
 
 ## Configuration
 
-Edit `radio/constants.py` to configure paths and settings:
+### Directory Paths
 
+Music directory paths can be configured via environment variables in your `.env` file (recommended) or by editing `radio/constants.py`:
+
+**Via `.env` file (recommended):**
+```bash
+REGULAR_MUSIC_PATH=~/source/appalachia-radio/songs
+HOLIDAY_MUSIC_PATH=~/source/appalachia-radio/holiday_songs
+DJ_PATH=~/source/appalachia-radio/julie
+```
+
+**Or edit `radio/constants.py` directly:**
 ```python
 REGULAR_MUSIC_PATH = os.path.expanduser('~/radio/songs')
 HOLIDAY_MUSIC_PATH = os.path.expanduser('~/radio/holiday_songs')
 DJ_PATH = os.path.expanduser('~/radio/julie')
 ```
+
+Paths can use `~` for home directory expansion. If not set, defaults are used.
 
 ### Tuning Parameters
 
