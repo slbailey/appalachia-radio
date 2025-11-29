@@ -492,7 +492,7 @@ def main() -> None:
         # Graceful shutdown
         logger.info("Shutting down...")
         try:
-        player.audio_player.stop()
+            player.audio_player.stop()
         except Exception as e:
             logger.warning(f"Error stopping audio player: {e}")
         

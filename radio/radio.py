@@ -399,7 +399,7 @@ class MusicPlayer:
         """
         # Get available files
         try:
-        regular_files, holiday_files = self._get_song_files()
+            regular_files, holiday_files = self._get_song_files()
         except Exception as e:
             logger.error(f"Error getting song files: {e}", exc_info=True)
             return False
@@ -437,8 +437,8 @@ class MusicPlayer:
         
         # Play intro
         try:
-        play_intro = self._play_dj_segment(random_mp3, 'intro', dj_probability)
-        dj_talked = play_intro
+            play_intro = self._play_dj_segment(random_mp3, 'intro', dj_probability)
+            dj_talked = play_intro
         except Exception as e:
             logger.error(f"Error playing intro: {e}", exc_info=True)
             play_intro = False
@@ -452,9 +452,9 @@ class MusicPlayer:
         # Play outro (only if intro didn't play)
         if not play_intro:
             try:
-            play_outro = self._play_dj_segment(random_mp3, 'outro', dj_probability)
-            if play_outro:
-                dj_talked = True
+                play_outro = self._play_dj_segment(random_mp3, 'outro', dj_probability)
+                if play_outro:
+                    dj_talked = True
             except Exception as e:
                 logger.error(f"Error playing outro: {e}", exc_info=True)
         else:
@@ -467,7 +467,7 @@ class MusicPlayer:
         
         # Update history
         try:
-        self.playlist_manager.update_history(random_mp3, is_holiday_song)
+            self.playlist_manager.update_history(random_mp3, is_holiday_song)
         except Exception as e:
             logger.warning(f"Error updating history: {e}", exc_info=True)
             # Don't fail playback if history update fails
