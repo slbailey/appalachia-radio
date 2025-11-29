@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 logs/
 *.log
+# Environment files with secrets
+.env
+.env.local
+.env.*.local

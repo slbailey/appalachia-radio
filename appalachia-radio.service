@@ -8,6 +8,10 @@ Type=simple
 User=pi
 WorkingDirectory=/home/pi/appalachia-radio
 Environment="PATH=/home/pi/appalachia-radio/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Load environment variables from .env file
+# Create /home/pi/appalachia-radio/.env with your configuration
+# See ENV_SETUP.md for details
+EnvironmentFile=/home/pi/appalachia-radio/.env
 ExecStart=/home/pi/appalachia-radio/venv/bin/python /home/pi/appalachia-radio/main.py
 Restart=always
 RestartSec=10

@@ -1,4 +1,34 @@
-# playlist_manager.py
+"""
+Playlist management module for intelligent song selection.
+
+This module provides the PlaylistManager class, which implements sophisticated
+algorithms for:
+- Tracking play history and counts
+- Calculating weighted probabilities for fair song selection
+- Holiday season detection and probability calculation
+- Preventing immediate repeats and ensuring variety
+
+The selection algorithm uses multiple factors:
+- Recent play history (queue-like system)
+- Time since last play (bonus for old songs)
+- Play count balance (fair distribution)
+- Never-played bonus (ensures all songs get played)
+
+Example:
+    ```python
+    from radio.playlist_manager import PlaylistManager
+    
+    manager = PlaylistManager()
+    manager.initialize_play_counts("/path/to/songs", "/path/to/holiday")
+    
+    # Calculate probabilities for song selection
+    probs, files, is_holiday = manager.calculate_probabilities(
+        regular_files=["song1.mp3", "song2.mp3"],
+        holiday_files=["holiday1.mp3"]
+    )
+    ```
+"""
+
 import logging
 import os
 import time
@@ -12,10 +42,48 @@ from .constants import (
 logger = logging.getLogger(__name__)
 
 class PlaylistManager:
-    """Manages playlist logic, play counts, and song selection probabilities."""
+    """
+    Manages playlist logic, play counts, and song selection probabilities.
+    
+    This class implements an intelligent song selection system that ensures:
+    - Fair distribution of songs (no song is ignored)
+    - Variety (recently played songs are less likely)
+    - Balance (songs with fewer plays get higher weight)
+    - Time awareness (old songs get bonus weight)
+    
+    The class maintains:
+    - Play history (recent songs with timestamps)
+    - Play counts (how many times each song has been played)
+    - Separate tracking for regular and holiday songs
+    
+    Attributes:
+        history (List[Tuple[str, float, bool]]): List of (song_name, timestamp, is_holiday)
+        play_counts (dict[str, int]): Map of regular song names to play counts
+        holiday_play_counts (dict[str, int]): Map of holiday song names to play counts
+        
+    Example:
+        ```python
+        manager = PlaylistManager()
+        manager.initialize_play_counts("/songs", "/holiday")
+        
+        # Update after playing a song
+        manager.update_history("song.mp3", is_holiday=False)
+        
+        # Get selection probabilities
+        probs, files, is_holiday = manager.calculate_probabilities(
+            regular_files=["song1.mp3", "song2.mp3"],
+            holiday_files=[]
+        )
+        ```
+    """
     
     def __init__(self) -> None:
-        """Initialize the playlist manager."""
+        """
+        Initialize the playlist manager.
+        
+        Creates empty data structures for tracking play history and counts.
+        Call initialize_play_counts() to populate play counts from directories.
+        """
         self.history: List[Tuple[str, float, bool]] = []  # (song_name, timestamp, is_holiday)
         self.play_counts: dict[str, int] = {}  # Tracks how many times each song has been played
         self.holiday_play_counts: dict[str, int] = {}  # Separate tracking for holiday songs
@@ -24,12 +92,23 @@ class PlaylistManager:
         """
         Initialize play counts for a single directory.
         
+        This method scans a directory for MP3 files and creates a dictionary
+        mapping each filename to a play count of 0. This establishes the baseline
+        for tracking which songs have been played.
+        
         Args:
             path: Path to music directory
-            is_holiday: Whether this is a holiday music directory
+            is_holiday: Whether this is a holiday music directory (for logging)
             
         Returns:
-            Dictionary mapping filenames to play counts (all 0)
+            Dictionary mapping filenames to play counts (all initialized to 0).
+            Empty dictionary if directory doesn't exist or is unreadable.
+            
+        Note:
+            - Only includes files with .mp3 extension
+            - Logs warning if directory doesn't exist
+            - Logs error if directory is unreadable
+            - Logs info message with count of initialized songs
         """
         if not os.path.exists(path):
             logger.warning(f"{'Holiday' if is_holiday else 'Regular'} music path does not exist: {path}")
@@ -46,21 +125,41 @@ class PlaylistManager:
     
     def initialize_play_counts(self, regular_path: str, holiday_path: str) -> None:
         """
-        Initialize play count tracking for all songs.
+        Initialize play count tracking for all songs in both directories.
+        
+        This method scans both the regular and holiday music directories and
+        initializes play count tracking for all MP3 files found. This should
+        be called once during player initialization.
         
         Args:
             regular_path: Path to regular music directory
             holiday_path: Path to holiday music directory
+            
+        Note:
+            - Creates separate tracking dictionaries for regular and holiday songs
+            - All play counts start at 0
+            - Safe to call multiple times (will re-scan directories)
+            - Logs information about how many songs were found in each directory
         """
         self.play_counts = self._initialize_play_counts_for_path(regular_path, is_holiday=False)
         self.holiday_play_counts = self._initialize_play_counts_for_path(holiday_path, is_holiday=True)
 
     def is_holiday_season(self) -> bool:
         """
-        Check if current date is within holiday season (Nov 1 - Dec 31).
+        Check if current date is within holiday season.
+        
+        The holiday season is defined as November 1 through December 31.
+        This method is used to determine whether holiday songs should be
+        considered for selection.
         
         Returns:
-            True if within holiday season, False otherwise
+            True if current date is in November or December, False otherwise.
+            
+        Example:
+            - November 1: True
+            - December 25: True
+            - January 1: False
+            - October 31: False
         """
         current_date = datetime.now()
         if current_date.month == 11:
@@ -73,11 +172,32 @@ class PlaylistManager:
         """
         Calculate the probability of selecting a holiday song based on date.
         
+        This method implements a date-based probability curve that increases
+        throughout the holiday season:
+        - November 1: 1% chance
+        - Linear progression to December 25: 33% chance
+        - December 26-31: 33% chance (stays at maximum)
+        - Outside holiday season: 0% chance
+        
+        The probability is calculated based on days from November 1, creating
+        a smooth progression that makes holiday songs more likely as Christmas
+        approaches.
+        
         Returns:
-            Probability between 0.0 and 0.33 (0% to 33%)
-            - Nov 1: 0.01 (1%)
-            - Midpoint (Dec 12-13): ~0.17 (17%)
-            - Dec 25-31: 0.33 (33%)
+            Probability between 0.0 and 0.33 (0% to 33%).
+            
+        Note:
+            - Returns 0.0 outside of November-December
+            - Uses linear interpolation between Nov 1 and Dec 25
+            - Maximum probability is 0.33 (33%)
+            
+        Example:
+            ```python
+            prob = manager.get_holiday_selection_probability()
+            if random.random() < prob:
+                # Select holiday song
+                pass
+            ```
         """
         if not self.is_holiday_season():
             return 0.0
@@ -115,14 +235,56 @@ class PlaylistManager:
         self, regular_files: List[str], holiday_files: List[str]
     ) -> Tuple[List[float], List[str], List[bool]]:
         """
-        Calculate probabilities for both regular and holiday songs.
+        Calculate weighted probabilities for song selection.
+        
+        This method implements a sophisticated weighting algorithm that considers
+        multiple factors to ensure fair and varied song selection:
+        
+        1. **Recent Play Penalty**: Songs played recently get reduced weight
+           - Last song: IMMEDIATE_REPEAT_PENALTY (almost eliminated)
+           - Recent window (last 20 songs): Decreasing penalty based on position
+           - Beyond recent window: No penalty
+        
+        2. **Time-Based Bonus**: Songs not played in a while get bonus weight
+           - More than 1 hour: Increasing bonus up to MAX_TIME_BONUS
+           - Formula: (hours_since_play / 24) ^ 0.5
+        
+        3. **Never-Played Bonus**: Songs never played get NEVER_PLAYED_BONUS multiplier
+        
+        4. **Play Count Balance**: Songs with fewer plays get higher weight
+           - Formula: (expected_plays + 1) / (actual_plays + 1)
+           - Ensures all songs get fair play over time
+        
+        The final probabilities are normalized so they sum to 1.0, making them
+        suitable for use with random.choices().
         
         Args:
             regular_files: List of regular song filenames
             holiday_files: List of holiday song filenames
             
         Returns:
-            Tuple of (probabilities, all_files, is_holiday_list)
+            Tuple of:
+            - probabilities: List of float weights (normalized to sum to 1.0)
+            - all_files: List of all song filenames (regular + holiday)
+            - is_holiday_list: List of booleans indicating holiday status
+            
+        Note:
+            - Probabilities are normalized to sum to 1.0
+            - If all probabilities are 0, equal weights are assigned
+            - Separate play counts are maintained for regular and holiday songs
+            - History is searched from most recent to oldest for efficiency
+            
+        Example:
+            ```python
+            probs, files, is_holiday = manager.calculate_probabilities(
+                regular_files=["song1.mp3", "song2.mp3"],
+                holiday_files=["holiday1.mp3"]
+            )
+            
+            # Select song using weighted random
+            selected_index = random.choices(range(len(files)), weights=probs)[0]
+            selected_song = files[selected_index]
+            ```
         """
         current_time = time.time()
         probabilities = []
@@ -196,9 +358,24 @@ class PlaylistManager:
         """
         Update play history and counts for a played song.
         
+        This method should be called after each song is played to:
+        1. Add the song to play history with current timestamp
+        2. Increment the play count for the song
+        3. Maintain history size limit (removes oldest entries)
+        
+        The history is used by calculate_probabilities() to determine recent
+        play penalties, and play counts are used for balance calculations.
+        
         Args:
-            mp3_file: Name of the song file that was played
-            is_holiday: Whether the song is a holiday song
+            mp3_file: Name of the song file that was played (e.g., "song.mp3")
+            is_holiday: Whether the song is a holiday song (determines which
+                       play_counts dictionary to update)
+            
+        Note:
+            - History is limited to HISTORY_SIZE entries (oldest removed)
+            - Play counts are incremented (initialized to 0 if first play)
+            - Timestamp is current time in seconds since epoch
+            - Separate tracking for regular and holiday songs
         """
         current_time = time.time()
         self.history.append((mp3_file, current_time, is_holiday))
