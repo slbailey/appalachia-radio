@@ -1,0 +1,266 @@
+Phase 8: Operational Polish — Config, Logging, and Now-Playing Metadata
+
+You have a working automated station:
+
+LibraryManager + PlaylistManager selecting songs
+
+DJEngine generating intros/outros
+
+PlayoutEngine driving AudioDecoder → AudioMixer → FMSink/YouTubeSink
+
+Station loop scheduling songs continuously
+
+Now we improve operational quality:
+
+Centralized configuration
+
+Structured logging
+
+“Now playing” metadata (for debugging + potential UI)
+
+Graceful shutdown (no orphaned aplay/ffmpeg processes)
+
+We are NOT adding crossfades or advanced DSP in this phase.
+
+TASK 1 — Central Config Module
+
+Create:
+
+app/config.py
+
+Implement:
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+@dataclass
+class RadioConfig:
+    music_root: Path              # base directory for music library
+    dj_path: Path                 # directory for DJ intros/outros
+    fm_device: str                # ALSA device name, e.g. "default" or "plughw:1,0"
+    enable_youtube: bool          # toggle YouTube sink
+    rtmp_url: Optional[str]       # full RTMP URL including stream key, if enabled
+    refresh_interval_seconds: int # library refresh interval
+    log_level: str                # "INFO", "DEBUG", etc.
+    now_playing_path: Path        # file to write current track metadata to
+
+
+Also implement a helper:
+
+def load_config_from_env_and_args(args: Optional[list[str]] = None) -> RadioConfig:
+    """
+    - Read environment variables (e.g. MUSIC_ROOT, DJ_PATH, FM_DEVICE, ENABLE_YOUTUBE, RTMP_URL, LOG_LEVEL, NOW_PLAYING_PATH, REFRESH_INTERVAL_SECONDS).
+    - Allow CLI args (via argparse in app/radio.py) to override env.
+    - Expand ~ in paths.
+    - Provide sensible defaults if env/args not set.
+    """
+
+
+Update app/radio.py so main():
+
+Uses argparse to build a minimal set of overrides
+
+Calls load_config_from_env_and_args(...)
+
+Passes a RadioConfig into start_station(config: RadioConfig) instead of loose params.
+
+TASK 2 — Structured Logging
+
+Add a logging setup in app/radio.py:
+
+Use logging.basicConfig(...)
+
+Format: '%(asctime)s [%(levelname)s] %(name)s: %(message)s'
+
+Level is driven by config.log_level
+
+Ensure all major modules (station.py, dj_engine.py, playout_engine.py, sinks) use logging.getLogger(__name__)
+
+Add log messages for:
+
+Station startup: music root, DJ path, FM device, YouTube enabled/disabled
+
+Each song start: file path (or basename) and whether intro/outro used
+
+Fatal errors in FMSink and PlayoutEngine
+
+YouTubeSink connect/disconnect events
+
+TASK 3 — “Now Playing” Metadata
+
+Create a new module:
+
+app/now_playing.py
+
+Implement:
+
+from dataclasses import dataclass, asdict
+from pathlib import Path
+import json
+import time
+import threading
+
+@dataclass
+class NowPlaying:
+    title: str
+    path: str
+    started_at: float   # UNIX timestamp
+    intro_used: bool
+    outro_used: bool
+
+class NowPlayingWriter:
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock = threading.Lock()
+
+    def write(self, now_playing: NowPlaying) -> None:
+        """
+        Write JSON to the configured file atomically:
+        - Use a temp file + rename to avoid partial writes.
+        """
+
+
+Behavior:
+
+write() should:
+
+Serialize asdict(now_playing) to JSON
+
+Write to path.with_suffix(".tmp")
+
+os.replace(tmp, final) for atomic update
+
+Update app/station.py:
+
+Station.init receives a NowPlayingWriter instance.
+
+Inside the scheduling loop, when a new song is selected and its events are queued:
+
+Determine:
+
+title = os.path.basename(song_path)
+
+intro_used = any(event.type == "intro")
+
+outro_used = any(event.type == "outro")
+
+Create a NowPlaying(...) with started_at = time.time()
+
+Call now_playing_writer.write(...)
+
+Also log "Now playing: {title} (intro={intro_used}, outro={outro_used})"
+
+No need for continuous updates; one write per song start is enough.
+
+TASK 4 — Graceful Shutdown
+
+Goal: Ctrl-C (SIGINT) should:
+
+Stop Station scheduling loop
+
+Stop PlayoutEngine loop
+
+Stop YouTubeSink worker
+
+Stop FMSink (kill aplay)
+
+Exit cleanly without zombie processes
+
+Implementation:
+
+In app/radio.py:
+
+Use signal.signal(signal.SIGINT, handler) and signal.signal(signal.SIGTERM, handler).
+
+handler should:
+
+Log a “Shutdown requested” message.
+
+Set a global or injected threading.Event (e.g. shutdown_event).
+
+PlayoutEngine already has stop_event. Ensure:
+
+run() exits when its stop_event is set.
+
+Add a public stop() method:
+
+def stop(self) -> None:
+    self._stop_event.set()
+
+
+Station loop:
+
+Take a shutdown_event: threading.Event in the constructor.
+
+In run(), check shutdown_event.is_set() at each loop iteration:
+
+If set, break the loop gracefully.
+
+In start_station(config: RadioConfig):
+
+Create shutdown_event = threading.Event()
+
+Pass it to:
+
+Station
+
+PlayoutEngine (or use its internal stop_event directly)
+
+Run PlayoutEngine in one thread, Station in the main thread (or vice versa).
+
+When shutdown_event is set:
+
+Call playout_engine.stop()
+
+Stop sinks:
+
+FMSink.stop()
+
+YouTubeSink.stop() if present
+
+Join the playout thread.
+
+Make sure FMSink and YouTubeSink stop() methods are idempotent and handle being called multiple times safely.
+
+GUARDRAILS
+
+Do NOT modify AudioDecoder or Mixer behavior in this phase.
+
+Do NOT introduce crossfade, ducking, or multi-source mixing.
+
+Do NOT change the locked interfaces (AudioEvent, PlayoutEngine public API, SinkBase API).
+
+Focus only on:
+
+Config
+
+Logging
+
+Now-playing metadata
+
+Shutdown behavior
+
+SUCCESS CRITERIA
+
+When you are done, ensure:
+
+Code compiles.
+
+python -m app.radio:
+
+Reads config via RadioConfig.
+
+Logs startup parameters.
+
+Logs each song + DJ usage.
+
+Writes a now-playing JSON file per new song.
+
+Shuts down cleanly on Ctrl-C without stack traces or zombie processes.
+
+When everything is complete, print exactly:
+
+Phase 8 complete. Ready for next steps.
+
+Only that line.

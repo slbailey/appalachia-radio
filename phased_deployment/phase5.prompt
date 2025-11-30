@@ -1,0 +1,349 @@
+Phase 5: Implement Sinks + FM/YouTube wiring
+
+You have:
+- AudioDecoder → streaming PCM frames
+- AudioMixer → push_frame(frame) to all sinks
+- PlayoutEngine → decodes AudioEvents and pushes frames to mixer
+
+Now we implement REAL OUTPUTS:
+
+- outputs/sink_base.py   (full)
+- outputs/fm_sink.py     (FM card via ALSA / aplay)
+- outputs/youtube_sink.py (RTMP via ffmpeg)
+
+And lightly wire them into app/radio.py so that:
+- There is a realistic FM sink implementation
+- There is a realistic YouTube sink implementation (optional, reconnecting)
+- AudioMixer sends frames to FM first, then YouTube if enabled
+
+Use ARCHITECTURE.md + Implementation Notes as source of truth.
+
+------------------------------------------------
+0) IMPORTANT CONSTRAINTS
+------------------------------------------------
+- PCM format is LOCKED:
+  - s16le, stereo, 48000 Hz
+- Frame size is ~4096 bytes (configurable), consistent across decoder and mixer.
+- FMSink is PRIMARY (blocking, fatal on failure).
+- YouTubeSink is SECONDARY (non-blocking, tries to reconnect in the background).
+
+No named pipes. No intermediate files.
+PCM goes directly into sinks.
+
+------------------------------------------------
+1) sink_base.py – FULL IMPLEMENTATION
+------------------------------------------------
+
+Implement SinkBase as an ABC, matching the LOCKED interface:
+
+```python
+from abc import ABC, abstractmethod
+
+class SinkBase(ABC):
+    @abstractmethod
+    def write_frame(self, pcm_frame: bytes) -> None:
+        """Write a single PCM frame chunk to the sink."""
+    
+    @abstractmethod
+    def start(self) -> bool:
+        """Start the sink (e.g., open device, connect stream). Return True if successful."""
+    
+    @abstractmethod
+    def stop(self) -> None:
+        """Stop the sink (e.g., close device, disconnect stream)."""
+Additionally:
+
+Provide basic attributes and behavior for all sinks:
+
+self._running: bool
+
+property running (read-only)
+
+start() should set _running = True on success.
+
+stop() should set _running = False.
+
+This base class does NOT know about threads or subprocesses directly,
+but you may add protected helpers if useful.
+
+fm_sink.py – IMPLEMENT REAL FM OUTPUT
+
+Implement FMSink using aplay as the simplest, dependency-free way to talk to ALSA.
+
+We assume:
+
+System has aplay available.
+
+FM transmitter card is exposed as a standard audio device.
+
+Device name will be configurable.
+
+Implementation details:
+
+python
+Copy code
+import subprocess
+import threading
+from .sink_base import SinkBase
+
+class FMSink(SinkBase):
+    def __init__(self, device: str = "default", sample_rate: int = 48000, channels: int = 2):
+        ...
+Use subprocess.Popen to spawn:
+
+bash
+Copy code
+aplay -f S16_LE -c 2 -r 48000 -D <device>
+Command in Python:
+
+python
+Copy code
+["aplay", "-f", "S16_LE", "-c", str(channels), "-r", str(sample_rate), "-D", device]
+Open with stdin=subprocess.PIPE.
+
+start():
+
+Spawn the aplay process.
+
+If successful, set self._running = True and return True.
+
+If Aplay fails (OSError, etc.), log and return False.
+
+write_frame(pcm_frame: bytes):
+
+If not running → return immediately.
+
+Write frame bytes to self._process.stdin.
+
+Flush is NOT necessary every frame (pipe).
+
+On BrokenPipeError or process death:
+
+Log critical error.
+
+Set running = False.
+
+Optionally raise an exception (FM failure is FATAL for the system).
+
+stop():
+
+If process exists:
+
+Try to close stdin.
+
+Terminate or kill the process.
+
+Set running = False.
+
+No internal buffering here: FM is the critical path and should write synchronously.
+If writes block, that’s back-pressure from the device.
+
+youtube_sink.py – IMPLEMENT NON-BLOCKING RTMP OUTPUT
+
+Implement YouTubeSink as a secondary sink that:
+
+Uses ffmpeg to send PCM → RTMP.
+
+Runs a background worker thread that reads from an internal queue and writes to ffmpeg stdin.
+
+write_frame() enqueues frames into an internal ring buffer (non-blocking from mixer perspective).
+
+When ffmpeg fails or disconnects, it retries after a delay.
+
+Config assumptions:
+
+RTMP URL + stream key provided to YouTubeSink via constructor.
+e.g.:
+
+python
+Copy code
+class YouTubeSink(SinkBase):
+    def __init__(self, rtmp_url: str, reconnect_delay: float = 5.0, max_buffer_frames: int = 2000):
+        ...
+Implementation steps:
+
+Internal Structures
+
+Use collections.deque for frame queue.
+
+Use threading.Lock + threading.Event for coordination.
+
+Keep:
+
+self._thread: Optional[threading.Thread]
+
+self._process: Optional[subprocess.Popen]
+
+self._queue: deque[bytes]
+
+self._reconnect_delay: float
+
+self._max_buffer_frames: int
+
+FFmpeg Command
+
+Expect raw PCM from stdin:
+
+bash
+Copy code
+ffmpeg -f s16le -ac 2 -ar 48000 -i pipe:0 \
+       -c:a aac -b:a 160k \
+       -f flv <rtmp_url>
+Use -loglevel error or quiet to avoid spam.
+
+start():
+
+If already running, return True.
+
+Spawn background thread:
+
+Target: _worker_loop()
+
+Thread is daemon: True
+
+Set running=True.
+
+Return True.
+
+write_frame(pcm_frame):
+
+If not running → return immediately.
+
+Acquire lock, append frame to queue.
+
+If queue length exceeds max_buffer_frames:
+
+Pop from left (drop OLDEST frames).
+
+Set an event so worker wakes up if sleeping.
+
+_worker_loop() (internal):
+
+Loop while self._running is True.
+
+Ensure ffmpeg process is running; if not:
+
+Attempt _start_ffmpeg_process().
+
+On failure: sleep(reconnect_delay) then retry.
+
+While process is alive and running:
+
+If queue is empty:
+
+Wait on event with timeout (e.g., 0.5s).
+
+Continue.
+
+Else:
+
+Pop one frame from queue.
+
+Write to process.stdin.
+
+Handle BrokenPipe or process death:
+
+Break inner loop, close process, and let outer loop reconnect.
+
+_start_ffmpeg_process():
+
+Spawns ffmpeg with stdin=PIPE.
+
+On failure, returns False.
+
+stop():
+
+Set running = False.
+
+Signal thread to exit.
+
+If process exists:
+
+Close stdin.
+
+Terminate or kill process.
+
+Join worker thread if alive.
+
+YouTubeSink MUST NEVER raise errors to mixer.
+All errors get logged and handled internally with retries.
+
+Update AudioMixer to Use SinkBase Correctly
+
+In mixer/audio_mixer.py:
+
+Ensure AudioMixer stores sinks as list[SinkBase].
+
+Ensure there is an explicit set_primary_sink() OR it automatically treats the first FMSink added as primary.
+
+push_frame() should:
+
+Write to FM sink first.
+
+Then write to other sinks.
+
+If FM errors → propagate (FM is critical).
+
+If non-FM errors → log and continue.
+
+If you already implemented this behavior in Phase 3, just ensure it uses SinkBase and type hints are consistent.
+
+Light Wiring in app/radio.py
+
+Extend build_engine() to something like:
+
+python
+Copy code
+from mixer.audio_mixer import AudioMixer
+from outputs.fm_sink import FMSink
+from outputs.youtube_sink import YouTubeSink
+from broadcast_core.playout_engine import PlayoutEngine
+
+def build_engine(enable_youtube: bool = False, rtmp_url: str | None = None) -> PlayoutEngine:
+    mixer = AudioMixer()
+    
+    fm_sink = FMSink(device="default")  # TODO: Make configurable
+    fm_sink.start()
+    mixer.add_sink(fm_sink)
+    
+    if enable_youtube and rtmp_url:
+        yt_sink = YouTubeSink(rtmp_url=rtmp_url)
+        yt_sink.start()
+        mixer.add_sink(yt_sink)
+    
+    engine = PlayoutEngine(mixer=mixer)
+    return engine
+Do NOT implement main() or CLI here yet.
+Just ensure build_engine can be used by tests or later wiring.
+
+GUARDRAILS
+
+Do NOT implement DJ logic yet.
+
+Do NOT implement crossfade or multi-source mixing yet.
+
+Do NOT add scheduling logic in app/radio.py yet.
+
+Focus ONLY on:
+
+SinkBase
+
+FMSink
+
+YouTubeSink
+
+Mixer → sinks behavior
+
+build_engine() wiring
+
+SUCCESS CRITERIA
+✅ SinkBase ABC implemented with required methods + running flag.
+✅ FMSink starts aplay and writes frames to stdin synchronously.
+✅ YouTubeSink starts ffmpeg → RTMP and uses a background thread + frame queue.
+✅ AudioMixer routes frames to FM first, then others.
+✅ build_engine() constructs AudioMixer + FMSink (+ optional YouTubeSink) + PlayoutEngine.
+✅ Code compiles and types are consistent.
+
+WHEN DONE — PRINT ONLY THIS LINE:
+
+"Phase 5 complete. Ready for Phase 6: DJ logic extraction + integration."

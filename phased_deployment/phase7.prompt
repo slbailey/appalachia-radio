@@ -1,0 +1,96 @@
+You have completed Phase 6.
+Now implement Phase 7.
+
+Goal:
+Convert Appalachia Radio into a live, autonomous 24/7 station.
+
+TASK A — Create library_manager.py
+
+New file inside music-logic/:
+
+music-logic/library_manager.py
+
+
+Responsibilities:
+
+Scan music directory recursively
+
+Load .mp3 files only
+
+Maintain track list w/ periodic refresh
+
+Provide:
+
+get_all_tracks() -> list[str]         # full paths
+get_random_track() -> str
+
+
+Allow auto-refresh every X seconds (configurable).
+
+TASK B — Expand PlaylistManager
+
+Add:
+
+def select_next_song(self, available_tracks: list[str]) -> str
+
+
+Must:
+
+Accept full track list from LibraryManager
+
+Use existing probability history to pick next track
+
+Return ONE song path
+
+No blocking inside this function
+
+TASK C — Station Scheduler Thread
+
+Create a new file:
+
+app/station.py
+
+
+Responsibilities:
+
+Owns: LibraryManager + PlaylistManager + DJEngine + PlayoutEngine
+
+Runs scheduling loop forever:
+
+Pseudo-code to implement:
+
+def run(self):
+    while True:
+        track = playlist.select_next_song(library.get_all_tracks())
+        filename = os.path.basename(track)
+
+        events = build_events_for_song(filename, track, dj_engine, dj_path)
+        for ev in events:
+            playout.queue_event(ev)
+
+        wait until playout is idle
+
+
+Idle detection allowed by polling playout_engine.current_state() every 250–500ms.
+
+TASK D — Run the station
+
+Modify app/radio.py to:
+
+def start_station():
+    playout, dj_engine = build_engine(...)
+    Station(...).run()
+
+
+And allow:
+
+python -m app.radio
+
+
+to start the actual station.
+
+SUCCESS CRITERIA
+
+When complete, Cursor must print only:
+
+Phase 7 complete. Ready for Phase 8.

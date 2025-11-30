@@ -1,0 +1,94 @@
+You have completed Phase 5.
+Now begin Phase 6: DJ Logic Extraction & DJEngine integration.
+
+Your objective is to extract the DJ intro/outro selection logic from the old system and implement it inside the new dj-logic/ module as clean, testable components.
+
+🧠 Core Requirement
+
+Create + implement the following inside dj-logic/:
+
+File	Status	Objective
+rules_engine.py	🔥 Implement	Convert _calculate_dj_probability from legacy code into pure probability logic
+cadence_manager.py	🔥 Implement	Manage songs_since_last_dj_talk and reset behavior
+track_matcher.py	🔥 Implement	Pull intro/outro discovery logic from DJManager including caching & filename patterns
+dj_engine.py	🔥 Implement	High-level orchestrator that: uses RulesEngine + CadenceManager + TrackMatcher, decides intro/outro, returns list of DJSegment objects
+
+All four modules must read-only interact with the filesystem & return data — no audio playback.
+
+🔒 Design Rules (must follow)
+
+DJEngine must return data, not frames
+Output must be a list of lightweight DJSegment objects:
+
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class DJSegment:
+    file_name: str
+    segment_type: Literal["intro", "outro"]
+
+
+Never output both intro + outro for one song
+Behavior must mirror old implementation — intro has priority, fallback to outro.
+
+Probability logic must match legacy _calculate_dj_probability exactly
+Increase probability based on # of songs since last DJ talk.
+
+CadenceManager must update once per song
+If DJ plays → reset counter
+If not → increment
+
+TrackMatcher must replicate filename resolution logic
+For song MySong.mp3 → check:
+
+MySong_intro1.mp3
+MySong_intro2.mp3
+MySong_intro.mp3
+(same pattern for outro)
+
+
+Use caching with TTL to avoid repeated directory scans.
+
+🧩 Integration Task (in app/radio.py)
+
+Add:
+
+Create DJEngine inside build_engine()
+
+Implement helper:
+
+def build_events_for_song(song_file, full_path, dj_engine, dj_path) -> list[AudioEvent]
+
+
+This must output:
+
+[ intro? ] → AudioEvent(song) → [ outro? ]
+
+
+but NEVER intro+outro together.
+
+Do NOT modify PlayoutEngine.
+Do NOT begin scheduling loop — that’s Phase 7.
+
+📌 Deliverables Cursor Must Generate
+
+Full implemented versions of:
+
+dj-logic/rules_engine.py
+dj-logic/cadence_manager.py
+dj-logic/track_matcher.py
+dj-logic/dj_engine.py
+
+
+Update app/radio.py:
+
+✔ return dj_engine from build_engine()
+✔ add build_events_for_song() helper
+
+When code compiles & passes through imports → print:
+
+Phase 6 complete. Ready for Phase 7.
+
+
+ONLY that line.

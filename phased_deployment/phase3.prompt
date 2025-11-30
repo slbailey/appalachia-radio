@@ -1,0 +1,93 @@
+Phase 3: Implement AudioDecoder + PCM pipeline
+
+Your objective now is to implement FRAME-BASED AUDIO DECODING,
+using the locked-in design:
+
+🔥 FFmpeg PCM pipe → streaming generator → yields 4096B–8192B frames
+
+---------------------------------------
+IMPLEMENT THE FOLLOWING FILES NOW:
+---------------------------------------
+
+mixer/audio_decoder.py  → IMPLEMENT FULLY
+mixer/pcm_buffer.py     → IMPLEMENT FULLY
+mixer/audio_mixer.py     → PARTIAL IMPLEMENTATION
+
+---------------------------------------
+1. audio_decoder.py (FULL IMPLEMENTATION)
+---------------------------------------
+Write a working FFmpeg-based decoder with:
+
+class AudioDecoder:
+    def __init__(self, path: str, frame_size: int = 4096):
+        """Initialize decoder for MP3 file"""
+
+    def stream_frames(self) -> Generator[bytes, None, None]:
+        """Yield PCM audio frames from FFmpeg pipe"""
+        - Spawn FFmpeg using subprocess.Popen
+        - Read stdout in chunks (frame_size bytes)
+        - Stop on EOF
+        - Ensure no buffering of entire file
+
+FFmpeg command MUST be exactly:
+
+ffmpeg -i <path> -f s16le -ac 2 -ar 48000 pipe:1 -loglevel quiet
+
+Include error handling:
+- If file missing or unreadable → raise Exception
+- If FFmpeg exits early → break gracefully
+
+---------------------------------------
+2. pcm_buffer.py (FULL IMPLEMENTATION)
+---------------------------------------
+Implement a thread-safe ring buffer for PCM audio frames:
+
+class PCMBuffer:
+    def write(frame: bytes) -> None
+    def read(frame_size: int) -> bytes | None
+    def available() -> int
+    def clear() -> None
+
+Requirements:
+- store frames in deque()
+- max buffer length configurable (default 2 seconds ≈ 2000 frames)
+- if full → drop OLDEST frames (never block decoder)
+
+---------------------------------------
+3. audio_mixer.py (PARTIAL IMPLEMENTATION)
+---------------------------------------
+Implement *Single-source pass-through only.*
+
+Full DSP/crossfade will come in Phase 5.
+
+For now:
+
+class AudioMixer:
+    def __init__(self, sinks: list = None):
+        - maintain list of sinks
+        - maintain PCMBuffer for output
+
+    def add_sink(self, sink) -> None
+
+    def push_frame(self, frame: bytes) -> None:
+        - write to all sinks
+        - do NOT mix multiple inputs yet
+
+    def mix_source(self, decoder: AudioDecoder) -> None:
+        - iterate decoder.stream_frames()
+        - pass each frame into push_frame()
+
+No multi-track mixing yet. No crossfade.  
+Just PCM → sinks.
+
+---------------------------------------
+SUCCESS CRITERIA
+---------------------------------------
+✔ Can decode MP3 → PCM frames live
+✔ Does not buffer whole file
+✔ Mixer can route frames to sinks (even if stubbed)
+✔ No playout or DJ logic implemented yet
+
+---------------------------------------
+WHEN DONE — PRINT ONLY THIS LINE:
+"Phase 3 complete. Ready for Phase 4: PlayoutEngine + Scheduling."

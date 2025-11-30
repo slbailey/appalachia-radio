@@ -1,0 +1,73 @@
+You are now executing Phase 2 of the Radio Broadcast System build.
+
+Architecture has been finalized and approved.  
+Your task is to generate the FIRST IMPLEMENTATION LAYER:
+
+🔥 CODE SCAFFOLDING ONLY — NO FULL AUDIO ENGINE YET 🔥  
+(We are building the foundation like a broadcast rack room.)
+
+-----------------------------------------------
+PHASE 2 OBJECTIVES
+-----------------------------------------------
+1. Create directory + file structure exactly as defined.
+2. Implement base classes, dataclasses, and method stubs.
+3. No business logic yet. No real decoding. No streaming.
+4. Components must compile and import cleanly.
+5. Use docstrings to describe behavior, not code it yet.
+
+-----------------------------------------------
+FILES TO GENERATE NOW:
+-----------------------------------------------
+
+📁 music-logic/
+   - playlist_manager.py (skeleton)
+   - song_history.py
+   - probability_engine.py
+
+📁 dj-logic/
+   - dj_engine.py
+   - rules_engine.py
+   - cadence_manager.py
+   - track_matcher.py
+
+📁 broadcast-core/
+   - playout_engine.py  ← use LOCKED-IN INTERFACE
+   - event_queue.py
+   - state_machine.py
+
+📁 mixer/
+   - audio_decoder.py   ← FFmpeg PCM pipe stub ONLY
+   - audio_mixer.py
+   - pcm_buffer.py
+
+📁 outputs/
+   - sink_base.py       ← implement ABC + 3 abstract methods
+   - fm_sink.py         ← stub only, frame write TODO
+   - youtube_sink.py    ← stub only, background reconnect TODO
+
+📁 app/
+   - radio.py           ← minimal runner + wiring placeholder
+
+🧱 Also generate:
+   - `__init__.py` files for each package
+
+-----------------------------------------------
+CRITICAL REQUIREMENTS
+-----------------------------------------------
+
+🚨 DO NOT implement real decoding yet
+     → audio_decoder should just define class + placeholder stream_frames()
+
+🚨 DO NOT implement playout logic yet
+     → run() may be empty or while: pass
+
+🚨 This phase is STRUCTURE ONLY.
+
+All methods should contain:
+    raise NotImplementedError("Phase 3 will implement this")
+
+-----------------------------------------------
+AFTER GENERATION, PRINT THIS EXACT MESSAGE:
+-----------------------------------------------
+
+"Phase 2 complete. Ready for Phase 3: AudioDecoder + Mixer implementation."

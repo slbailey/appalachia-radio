@@ -1,0 +1,239 @@
+Phase 4: Implement PlayoutEngine + Scheduling
+
+You have:
+- AudioDecoder (FFmpeg → PCM frame generator)
+- PCMBuffer (ring buffer)
+- AudioMixer (single-source pass-through: push_frame → sinks)
+
+Now implement the BROADCAST CORE:
+
+- broadcast_core/event_queue.py
+- broadcast_core/state_machine.py
+- broadcast_core/playout_engine.py
+
+Goal: A working, non-blocking(ish) playout loop that:
+- accepts AudioEvents
+- plays them in order
+- streams frames through AudioDecoder → AudioMixer → sinks
+- tracks playback state
+
+We are NOT doing DJ logic yet.
+We are NOT doing multi-source mixing yet.
+We are NOT wiring app/radio.py fully yet (that’s Phase 5+).
+
+Use the ARCHITECTURE.md as the source of truth and respect all LOCKED-IN interfaces.
+
+------------------------------------------------
+1) state_machine.py – IMPLEMENT FULLY
+------------------------------------------------
+
+Implement a minimal-but-solid PlaybackState model.
+
+Requirements:
+
+- Define an Enum for playback states:
+
+  - IDLE
+  - PLAYING_INTRO
+  - PLAYING_SONG
+  - PLAYING_OUTRO
+  - TRANSITIONING
+  - ERROR
+
+- Optionally, create a small `PlaybackContext` dataclass to track:
+  - current_event: Optional[AudioEvent]
+  - last_event: Optional[AudioEvent]
+  - state: PlaybackState
+
+- Provide helper methods:
+
+  - `is_playing(self) -> bool`
+  - `is_idle(self) -> bool`
+
+These can live as methods on PlaybackContext or simple functions.
+Keep it small and focused.
+
+------------------------------------------------
+2) event_queue.py – IMPLEMENT FULLY
+------------------------------------------------
+
+Implement a thread-safe event queue for `AudioEvent`s.
+
+Requirements:
+
+- Use `queue.Queue` internally (or `collections.deque` + `threading.Condition`)
+- Provide this API:
+
+  ```python
+  class EventQueue:
+      def put(self, event: AudioEvent) -> None: ...
+      def get(self, block: bool = True, timeout: float | None = None) -> AudioEvent | None: ...
+      def empty(self) -> bool: ...
+      def clear(self) -> None: ...
+get() should:
+
+Block by default until an event is available
+
+Return None on timeout if timeout provided
+
+clear() empties all pending events in a thread-safe manner.
+
+This will be used by PlayoutEngine’s main loop and by the app to enqueue events.
+
+playout_engine.py – IMPLEMENT CORE LOGIC
+
+YOU MUST respect the LOCKED-IN interface:
+
+python
+Copy code
+class PlayoutEngine:
+    def queue_event(self, event: AudioEvent) -> None: ...
+    def run(self) -> None: ...
+    def current_state(self) -> PlaybackState: ...
+You may add additional helper methods and init arguments,
+but these three MUST exist with these signatures.
+
+3.1 PlayoutEngine.init
+Constructor should accept:
+
+mixer: AudioMixer (required)
+
+event_queue: Optional[EventQueue] (if None, create internally)
+
+stop_event: Optional[threading.Event] (if None, create internally)
+
+logger: Optional[logging.Logger]
+
+Store:
+
+self._mixer
+
+self._queue
+
+self._state (using PlaybackContext or similar)
+
+self._stop_event
+
+3.2 queue_event()
+Simple: delegate to EventQueue.put(event)
+
+You may also add a convenience method queue_events(list[AudioEvent]), but the locked-in single-event API must exist.
+
+3.3 current_state()
+Return the current PlaybackState (not the full context).
+
+If you use PlaybackContext, this returns self._context.state.
+
+3.4 run() – MAIN LOOP
+Implement a loop that:
+
+While not self._stop_event.is_set():
+
+Block on self._queue.get(block=True)
+
+If None returned (e.g., due to timeout or stop), continue or break appropriately
+
+Set state based on event.type:
+
+"intro" → PLAYING_INTRO
+
+"song" → PLAYING_SONG
+
+"outro" → PLAYING_OUTRO
+
+"talk" → PLAYING_INTRO or a TALK-specific state if you want (or treat as intro)
+
+Create an AudioDecoder for event.path
+
+Call self._play_event(decoder, event) (a helper you implement)
+
+When finished, update state:
+
+If queue is empty → IDLE
+
+If error → ERROR
+
+Allow graceful shutdown:
+
+If stop_event is set while in the middle of a file, you may either:
+
+Finish that file, then stop
+
+Or break immediately (simpler for now)
+
+3.5 _play_event() – HELPER
+Implement a private method inside PlayoutEngine:
+
+python
+Copy code
+def _play_event(self, decoder: AudioDecoder, event: AudioEvent) -> None:
+    for frame in decoder.stream_frames():
+        # apply gain (event.gain) if needed
+        # for now: if gain != 1.0, multiply samples in-place (optional TODO comment)
+        self._mixer.push_frame(frame)
+        # optionally check stop_event to break early
+Do NOT buffer the whole file.
+
+Do NOT swallow all exceptions silently:
+
+Log decoding errors.
+
+Set PlaybackState.ERROR on fatal errors.
+
+Then continue to next event (best-effort).
+
+3.6 Threading Model
+For now, PlayoutEngine can be run in the current thread:
+
+run() is a blocking loop.
+
+The caller (app/radio.py later) can run it in a dedicated thread if desired.
+
+Do NOT create threads inside PlayoutEngine in this phase.
+Keep control with the caller.
+
+LIGHT TOUCH IN app/radio.py
+
+Do NOT fully wire up the app yet.
+
+But you MAY add a bootstrap() or build_engine() function that:
+
+Creates an AudioMixer()
+
+Creates a dummy FMSink (still stubbed from Phase 2)
+
+Creates PlayoutEngine(mixer=mixer)
+
+Returns the playout_engine instance, ready to be used
+
+No CLI, no argument parsing yet.
+
+GUARDRAILS
+
+Do NOT integrate DJEngine yet.
+
+Do NOT add crossfade or multi-source mixing yet.
+
+Do NOT talk to ALSA or YouTube yet (sinks still mostly stubs).
+
+Focus ONLY on:
+
+EventQueue
+
+State machine
+
+PlayoutEngine main loop
+
+AudioDecoder → AudioMixer → sinks path per event
+
+SUCCESS CRITERIA
+✅ PlayoutEngine.queue_event() enqueues an AudioEvent.
+✅ PlayoutEngine.run() consumes events and decodes them into PCM via AudioDecoder.
+✅ Frames are passed to AudioMixer.push_frame(frame).
+✅ EventQueue is thread-safe and works with blocking get().
+✅ PlaybackState is updated correctly (IDLE → PLAYING_* → IDLE/ERROR).
+✅ No circular imports or broken references.
+
+WHEN DONE — PRINT ONLY THIS LINE:
+
+"Phase 4 complete. Ready for Phase 5: Sinks + FM/YouTube wiring."
