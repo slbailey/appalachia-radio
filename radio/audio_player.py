@@ -57,7 +57,7 @@ class AudioPlayer:
         
         This method sets up pygame mixer for audio playback. It automatically
         configures a dummy video driver for headless environments (WSL, servers,
-        Raspberry Pi without display).
+        Raspberry Pi without display). Includes retry logic for "device busy" errors.
         
         Args:
             frequency: Audio frequency in Hz (default: 48000)
@@ -67,31 +67,69 @@ class AudioPlayer:
                         Smaller buffers = more CPU, less latency
             
         Raises:
-            pygame.error: If pygame mixer initialization fails (e.g., no audio device)
+            pygame.error: If pygame mixer initialization fails after retries
             
         Note:
             - Automatically detects headless environments (no DISPLAY variable)
+            - Configures pygame to use PulseAudio (instead of ALSA directly)
             - Creates a minimal dummy display surface (required by pygame)
+            - Includes retry logic for "device busy" errors (up to 3 attempts)
+            - Attempts to cleanup any existing pygame mixer instances before init
             - Logs success/failure messages
         """
-        try:
-            # Set dummy video driver for headless environments (WSL, servers, etc.)
-            if 'DISPLAY' not in os.environ:
-                os.environ['SDL_VIDEODRIVER'] = 'dummy'
-            
-            pygame.mixer.pre_init(frequency=frequency, buffer=buffer_size)
-            pygame.mixer.init()
-            
-            # Initialize display for headless environments (required by pygame)
-            if not pygame.display.get_init():
-                pygame.display.init()
-                # Create a minimal dummy surface (required but not used)
-                pygame.display.set_mode((1, 1), flags=pygame.HIDDEN)
-            
-            logger.info("Audio player initialized successfully")
-        except pygame.error as e:
-            logger.error(f"Failed to initialize audio player: {e}")
-            raise
+        # Set dummy video driver for headless environments (WSL, servers, etc.)
+        if 'DISPLAY' not in os.environ:
+            os.environ['SDL_VIDEODRIVER'] = 'dummy'
+        
+        # Use PulseAudio instead of ALSA directly (better for multi-client scenarios)
+        # This helps avoid "device busy" errors since PulseAudio manages multiple clients
+        if 'SDL_AUDIODRIVER' not in os.environ:
+            os.environ['SDL_AUDIODRIVER'] = 'pulse'
+            logger.debug("Configured pygame to use PulseAudio")
+        
+        max_retries = 3
+        retry_delay = 1.0  # seconds
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Try to cleanup any existing mixer instance first
+                if pygame.mixer.get_init():
+                    try:
+                        pygame.mixer.music.stop()
+                        pygame.mixer.quit()
+                        time.sleep(0.1)  # Brief pause for cleanup
+                    except Exception:
+                        pass  # Ignore cleanup errors
+                
+                pygame.mixer.pre_init(frequency=frequency, buffer=buffer_size)
+                pygame.mixer.init()
+                
+                # Initialize display for headless environments (required by pygame)
+                if not pygame.display.get_init():
+                    pygame.display.init()
+                    # Create a minimal dummy surface (required but not used)
+                    pygame.display.set_mode((1, 1), flags=pygame.HIDDEN)
+                
+                logger.info("Audio player initialized successfully")
+                return  # Success, exit the retry loop
+                
+            except pygame.error as e:
+                error_msg = str(e)
+                is_device_busy = 'busy' in error_msg.lower() or 'resource' in error_msg.lower()
+                
+                if attempt < max_retries and is_device_busy:
+                    logger.warning(f"Audio device busy (attempt {attempt}/{max_retries}), retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5  # Exponential backoff
+                else:
+                    logger.error(f"Failed to initialize audio player: {e}")
+                    if is_device_busy:
+                        logger.error("Audio device is busy. This usually means:")
+                        logger.error("  1. Another process is using the audio device")
+                        logger.error("  2. A previous instance didn't release the device properly")
+                        logger.error("  3. PulseAudio may need to be restarted: systemctl --user restart pulseaudio")
+                        logger.error("  4. Or check PulseAudio status: pulseaudio --check -v")
+                    raise
     
     def play(self, mp3_file: str) -> bool:
         """
