@@ -71,7 +71,8 @@ class AudioPlayer:
             
         Note:
             - Automatically detects headless environments (no DISPLAY variable)
-            - Configures pygame to use PulseAudio (instead of ALSA directly)
+            - Uses ALSA directly for FM transmitter playback
+            - PulseAudio is used separately for YouTube streaming monitoring
             - Creates a minimal dummy display surface (required by pygame)
             - Includes retry logic for "device busy" errors (up to 3 attempts)
             - Attempts to cleanup any existing pygame mixer instances before init
@@ -81,87 +82,54 @@ class AudioPlayer:
         if 'DISPLAY' not in os.environ:
             os.environ['SDL_VIDEODRIVER'] = 'dummy'
         
-        # Try PulseAudio first, fall back to ALSA if PulseAudio isn't available
-        # Save original value if set
-        original_audio_driver = os.environ.get('SDL_AUDIODRIVER')
-        audio_drivers = ['pulse', 'alsa']
+        # Use ALSA directly for FM transmitter playback
+        # Note: PulseAudio is used separately for YouTube streaming monitoring
+        if 'SDL_AUDIODRIVER' not in os.environ:
+            os.environ['SDL_AUDIODRIVER'] = 'alsa'
+            logger.debug("Configured pygame to use ALSA for FM transmitter playback")
         
         max_retries = 3
         retry_delay = 1.0  # seconds
-        last_error = None
         
-        for audio_driver in audio_drivers:
-            # Set the audio driver
-            if original_audio_driver:
-                os.environ['SDL_AUDIODRIVER'] = original_audio_driver
-            else:
-                os.environ['SDL_AUDIODRIVER'] = audio_driver
-                logger.debug(f"Trying audio driver: {audio_driver}")
-            
-            for attempt in range(1, max_retries + 1):
-                try:
-                    # Try to cleanup any existing mixer instance first
-                    if pygame.mixer.get_init():
-                        try:
-                            pygame.mixer.music.stop()
-                            pygame.mixer.quit()
-                            time.sleep(0.1)  # Brief pause for cleanup
-                        except Exception:
-                            pass  # Ignore cleanup errors
-                    
-                    pygame.mixer.pre_init(frequency=frequency, buffer=buffer_size)
-                    pygame.mixer.init()
-                    
-                    # Initialize display for headless environments (required by pygame)
-                    if not pygame.display.get_init():
-                        pygame.display.init()
-                        # Create a minimal dummy surface (required but not used)
-                        pygame.display.set_mode((1, 1), flags=pygame.HIDDEN)
-                    
-                    logger.info(f"Audio player initialized successfully using {audio_driver}")
-                    return  # Success, exit both loops
-                    
-                except pygame.error as e:
-                    error_msg = str(e)
-                    last_error = e
-                    is_device_busy = 'busy' in error_msg.lower() or 'resource' in error_msg.lower()
-                    is_connection_error = 'connection' in error_msg.lower() or 'pulseaudio' in error_msg.lower()
-                    
-                    # If it's a connection error with PulseAudio, try ALSA instead
-                    if is_connection_error and audio_driver == 'pulse':
-                        logger.warning(f"Could not connect to PulseAudio: {e}")
-                        logger.info("Falling back to ALSA audio driver...")
-                        break  # Break out of retry loop, try next driver
-                    
-                    # If it's a device busy error, retry
-                    if attempt < max_retries and is_device_busy:
-                        logger.warning(f"Audio device busy (attempt {attempt}/{max_retries}), retrying in {retry_delay}s...")
-                        time.sleep(retry_delay)
-                        retry_delay *= 1.5  # Exponential backoff
-                    else:
-                        # If this is the last driver, we're out of options
-                        if audio_driver == audio_drivers[-1]:
-                            logger.error(f"Failed to initialize audio player with {audio_driver}: {e}")
-                            if is_device_busy:
-                                logger.error("Audio device is busy. This usually means:")
-                                logger.error("  1. Another process is using the audio device")
-                                logger.error("  2. A previous instance didn't release the device properly")
-                                logger.error("  3. Try: sudo fuser -k /dev/snd/* (to kill processes using audio)")
-                            elif is_connection_error:
-                                logger.error("Could not connect to PulseAudio. Try:")
-                                logger.error("  1. systemctl --user restart pulseaudio")
-                                logger.error("  2. pulseaudio --check -v")
-                                logger.error("  3. Or ensure PulseAudio is running")
-                            raise
-                        # Otherwise, try next driver
-                        break
-        
-        # If we get here, all drivers failed
-        if last_error:
-            logger.error(f"Failed to initialize audio player with any driver. Last error: {last_error}")
-            raise last_error
-        else:
-            raise pygame.error("Failed to initialize audio player: Unknown error")
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Try to cleanup any existing mixer instance first
+                if pygame.mixer.get_init():
+                    try:
+                        pygame.mixer.music.stop()
+                        pygame.mixer.quit()
+                        time.sleep(0.1)  # Brief pause for cleanup
+                    except Exception:
+                        pass  # Ignore cleanup errors
+                
+                pygame.mixer.pre_init(frequency=frequency, buffer=buffer_size)
+                pygame.mixer.init()
+                
+                # Initialize display for headless environments (required by pygame)
+                if not pygame.display.get_init():
+                    pygame.display.init()
+                    # Create a minimal dummy surface (required but not used)
+                    pygame.display.set_mode((1, 1), flags=pygame.HIDDEN)
+                
+                logger.info("Audio player initialized successfully using ALSA")
+                return  # Success, exit the retry loop
+                
+            except pygame.error as e:
+                error_msg = str(e)
+                is_device_busy = 'busy' in error_msg.lower() or 'resource' in error_msg.lower()
+                
+                if attempt < max_retries and is_device_busy:
+                    logger.warning(f"Audio device busy (attempt {attempt}/{max_retries}), retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 1.5  # Exponential backoff
+                else:
+                    logger.error(f"Failed to initialize audio player: {e}")
+                    if is_device_busy:
+                        logger.error("Audio device is busy. This usually means:")
+                        logger.error("  1. Another process is using the audio device")
+                        logger.error("  2. A previous instance didn't release the device properly")
+                        logger.error("  3. Try: sudo fuser -k /dev/snd/* (to kill processes using audio)")
+                    raise
     
     def play(self, mp3_file: str) -> bool:
         """
