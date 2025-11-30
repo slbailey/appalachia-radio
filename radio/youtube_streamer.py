@@ -495,7 +495,8 @@ class YouTubeStreamer:
         
         try:
             logger.info("Starting YouTube stream...")
-            logger.debug(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
+            # Log the full command at INFO level for debugging
+            logger.info(f"FFmpeg command: {' '.join(ffmpeg_cmd)}")
             
             # Start FFmpeg process
             # Use stderr=subprocess.PIPE to capture error messages, but don't capture stdout
@@ -552,7 +553,18 @@ class YouTubeStreamer:
                         stderr_output = "Could not read stderr"
                 
                 logger.error(f"FFmpeg process exited immediately. Exit code: {self.process.returncode}")
-                logger.error(f"FFmpeg error output: {stderr_output[:500]}")  # First 500 chars
+                # Log full error output (split into multiple log lines if needed)
+                if stderr_output:
+                    logger.error("FFmpeg error output:")
+                    # Split into lines and log each (up to reasonable limit to avoid log spam)
+                    error_lines = stderr_output.split('\n')
+                    for i, line in enumerate(error_lines[:100]):  # First 100 lines
+                        if line.strip():
+                            logger.error(f"  {line}")
+                    if len(error_lines) > 100:
+                        logger.error(f"  ... (truncated, {len(error_lines) - 100} more lines)")
+                else:
+                    logger.error("No error output captured from FFmpeg")
                 self.process = None
                 return False
                 
