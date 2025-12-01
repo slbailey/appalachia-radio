@@ -212,12 +212,19 @@ class AudioMixer:
                 elif frame:
                     deliver_frame = frame
                 else:
-                    # No frame available - buffer underrun
-                    if frame_index != self._last_underrun_log_index + 1:
-                        logger.warning(f"[Mixer] Buffer underrun at frame_index={frame_index} (no frames available)")
-                        self._last_underrun_log_index = frame_index
-                    else:
-                        self._last_underrun_log_index = frame_index
+                    # No frame available - check if this is expected (decoder inactive = graceful shutdown)
+                    with self._decoder_lock:
+                        decoder_active = self.decoder.is_active()
+                    
+                    # Only warn about underrun if decoder is still active (unexpected)
+                    # If decoder is inactive, we're done (song finished, no new song queued) - this is expected
+                    if decoder_active:
+                        # Decoder is active but no frames - this is a real underrun
+                        if frame_index != self._last_underrun_log_index + 1:
+                            logger.warning(f"[Mixer] Buffer underrun at frame_index={frame_index} (no frames available)")
+                            self._last_underrun_log_index = frame_index
+                        else:
+                            self._last_underrun_log_index = frame_index
                     
                     # Generate silence frame only if we've had no data for >500ms
                     if self._last_data_time is None or (time.monotonic() - self._last_data_time) > 0.5:

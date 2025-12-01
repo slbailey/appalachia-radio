@@ -10,3 +10,5 @@ logs/
 .env.*.local
 .mypy_cache/
 .vscode/
+PotentialIssues.txt
+QuarantinedFiles.txt

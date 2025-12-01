@@ -15,12 +15,14 @@ The selection algorithm uses multiple factors:
 - Never-played bonus (ensures all songs get played)
 """
 
+import json
 import logging
 import os
 import random
 import time
 from datetime import datetime
-from typing import List, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -50,16 +52,20 @@ class PlaylistManager:
         holiday_play_counts: Map of holiday song names to play counts
     """
     
-    def __init__(self) -> None:
+    def __init__(self, state_file: Optional[str] = None) -> None:
         """
         Initialize the playlist manager.
         
         Creates empty data structures for tracking play history and counts.
         Call initialize_play_counts() to populate play counts from directories.
+        
+        Args:
+            state_file: Optional path to JSON file for saving/loading state
         """
         self.history: List[Tuple[str, float, bool]] = []  # (song_name, timestamp, is_holiday)
         self.play_counts: dict[str, int] = {}  # Tracks how many times each song has been played
         self.holiday_play_counts: dict[str, int] = {}  # Separate tracking for holiday songs
+        self.state_file: Optional[str] = state_file
     
     def initialize_play_counts(self, regular_path: str, holiday_path: str) -> None:
         """
@@ -367,4 +373,69 @@ class PlaylistManager:
             self.holiday_play_counts[mp3_file] = self.holiday_play_counts.get(mp3_file, 0) + 1
         else:
             self.play_counts[mp3_file] = self.play_counts.get(mp3_file, 0) + 1
+        
+        # Auto-save state after each update
+        if self.state_file:
+            self.save_state()
+    
+    def save_state(self) -> None:
+        """
+        Save playlist state (history and play counts) to JSON file.
+        
+        This preserves the weighted playlist state across restarts to prevent
+        immediate repeats after graceful restart.
+        """
+        if not self.state_file:
+            return
+        
+        try:
+            state = {
+                "history": self.history,
+                "play_counts": self.play_counts,
+                "holiday_play_counts": self.holiday_play_counts,
+            }
+            
+            # Write to temp file first, then rename (atomic operation)
+            temp_file = self.state_file + ".tmp"
+            with open(temp_file, "w") as f:
+                json.dump(state, f, indent=2)
+            
+            # Atomic rename
+            os.replace(temp_file, self.state_file)
+            
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Saved playlist state to {self.state_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save playlist state: {e}")
+    
+    def load_state(self) -> bool:
+        """
+        Load playlist state (history and play counts) from JSON file.
+        
+        Returns:
+            True if state was loaded successfully, False otherwise
+        """
+        if not self.state_file or not os.path.exists(self.state_file):
+            return False
+        
+        try:
+            with open(self.state_file, "r") as f:
+                state = json.load(f)
+            
+            # Restore state
+            self.history = [
+                (item[0], float(item[1]), bool(item[2]))
+                for item in state.get("history", [])
+            ]
+            self.play_counts = state.get("play_counts", {})
+            self.holiday_play_counts = state.get("holiday_play_counts", {})
+            
+            logger.info(
+                f"Loaded playlist state: {len(self.history)} history entries, "
+                f"{len(self.play_counts)} regular songs, {len(self.holiday_play_counts)} holiday songs"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to load playlist state: {e}")
+            return False
 

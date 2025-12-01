@@ -39,6 +39,7 @@ class RadioConfig:
     log_level: str  # Logging level: "INFO", "DEBUG", etc.
     debug: bool  # Enable verbose debug logging (periodic stats, frame-by-frame logs, etc.)
     now_playing_path: Path  # File to write current track metadata to
+    playlist_state_path: Path  # File to save/load playlist state (history and play counts)
 
 
 def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> RadioConfig:
@@ -135,6 +136,9 @@ def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> 
     now_playing_path = expand_path(
         get_value("now_playing_path", "NOW_PLAYING_PATH", "/tmp/now_playing.json")
     )
+    playlist_state_path = expand_path(
+        get_value("playlist_state_path", "PLAYLIST_STATE_PATH", "/tmp/playlist_state.json")
+    )
     
     return RadioConfig(
         regular_music_path=regular_music_path,
@@ -152,6 +156,7 @@ def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> 
         refresh_interval_seconds=refresh_interval_seconds,
         log_level=log_level,
         debug=debug,
-        now_playing_path=now_playing_path
+        now_playing_path=now_playing_path,
+        playlist_state_path=playlist_state_path
     )
 

@@ -38,9 +38,19 @@ class PlayoutEngine:
         self._running = False
         self._stop_event = stop_event if stop_event is not None else threading.Event()
         self.debug = debug
+        self._event_complete_callbacks: list = []  # List of callbacks for event completion
         
         # Set up event completion callback
         self.mixer.set_event_complete_callback(self._on_event_complete)
+    
+    def add_event_complete_callback(self, callback) -> None:
+        """
+        Add a callback to be called when an event completes.
+        
+        Args:
+            callback: Function that takes (event: AudioEvent) as argument
+        """
+        self._event_complete_callbacks.append(callback)
     
     def queue_event(self, event: AudioEvent) -> None:
         """
@@ -157,6 +167,13 @@ class PlayoutEngine:
         """
         logger.info(f"[ENGINE] Completed {event.path}")
         self.event_queue.task_done()
+        
+        # Call registered callbacks
+        for callback in self._event_complete_callbacks:
+            try:
+                callback(event)
+            except Exception as e:
+                logger.error(f"Error in event complete callback: {e}", exc_info=True)
         
         # Update state to IDLE only if:
         # 1. Queue is empty (no more events)

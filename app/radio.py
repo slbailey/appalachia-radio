@@ -172,6 +172,17 @@ def start_station(config: RadioConfig) -> None:
     Args:
         config: RadioConfig instance with all configuration values
     """
+    # Initialize PID file path early (needed for cleanup in finally block)
+    # Use /var/run if writable, otherwise fall back to project directory
+    # (systemd uses private /tmp directories which cause path issues)
+    default_pid_file = "/var/run/appalachia-radio.pid"
+    if not os.access(os.path.dirname(default_pid_file), os.W_OK):
+        # Fall back to project directory if /var/run is not writable
+        # Get project root (parent of app/ directory)
+        project_root = Path(__file__).parent.parent
+        default_pid_file = str(project_root / "appalachia-radio.pid")
+    pid_file = os.environ.get("PID_FILE", default_pid_file)
+    
     # Ensure logs directory exists
     os.makedirs("logs", exist_ok=True)
     
@@ -188,7 +199,9 @@ def start_station(config: RadioConfig) -> None:
         regular_music_path=str(config.regular_music_path),
         holiday_music_path=str(config.holiday_music_path)
     )
-    playlist_manager = PlaylistManager()
+    playlist_manager = PlaylistManager(state_file=str(config.playlist_state_path))
+    # Load saved state if available
+    playlist_manager.load_state()
     
     # Build RTMP URL if needed
     rtmp_url = config.rtmp_url
@@ -253,17 +266,39 @@ def start_station(config: RadioConfig) -> None:
         now_playing_writer=now_playing_writer
     )
     
-    # Handle signals for graceful shutdown (Phase 8)
-    def signal_handler(sig, frame):
-        logger.info("Shutdown requested")
+    # Handle SIGUSR1 for graceful restart (wait for current song to finish)
+    # Must be defined after station is created
+    def restart_handler(sig, frame):
+        logger.info("Restart requested - will restart after current song finishes")
+        station._restart_requested = True
+        # Also set shutdown to stop accepting new songs
         shutdown_event.set()
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGUSR1, restart_handler)
     
     # Run playout engine in separate thread
     playout_thread = threading.Thread(target=playout_engine.run, daemon=True)
     playout_thread.start()
+    
+    # Write PID file for restart scripts
+    try:
+        pid_value = os.getpid()
+        with open(pid_file, "w") as f:
+            f.write(str(pid_value))
+            f.flush()
+            os.fsync(f.fileno())  # Force write to disk
+        # Verify file exists and contains correct PID
+        if os.path.exists(pid_file):
+            with open(pid_file, "r") as f:
+                stored_pid = f.read().strip()
+            if stored_pid == str(pid_value):
+                logger.info(f"PID file written: {pid_file} (PID: {pid_value})")
+            else:
+                logger.warning(f"PID file mismatch: expected {pid_value}, got {stored_pid}")
+        else:
+            logger.warning(f"PID file was not created: {pid_file}")
+    except Exception as e:
+        logger.warning(f"Could not write PID file {pid_file}: {e}")
     
     try:
         # Run station in main thread
@@ -286,6 +321,28 @@ def start_station(config: RadioConfig) -> None:
         
         # Wait for playout thread to finish
         playout_thread.join(timeout=2.0)
+        
+        # Save playlist state before shutdown (via station, which has playlist_manager)
+        try:
+            station.playlist_manager.save_state()
+        except Exception as e:
+            if config.debug:
+                logger.warning(f"Failed to save playlist state: {e}")
+        
+        # Remove PID file (only if it contains our PID)
+        try:
+            if os.path.exists(pid_file):
+                try:
+                    with open(pid_file, "r") as f:
+                        stored_pid = int(f.read().strip())
+                    # Only remove if it's our PID (prevents removing PID from restarted process)
+                    if stored_pid == os.getpid():
+                        os.remove(pid_file)
+                except (ValueError, OSError):
+                    # File is corrupted or unreadable, remove it anyway
+                    os.remove(pid_file)
+        except Exception:
+            pass
 
 
 def main() -> None:

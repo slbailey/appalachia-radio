@@ -1,95 +1,174 @@
-# Radio Broadcast System - Architecture Documentation
+# Appalachia Radio – System Architecture
 
-## Table of Contents
+## 1. Executive Summary
 
-1. [System Overview](#system-overview)
-2. [Current Architecture](#current-architecture)
-3. [Rearchitected System Design](#rearchitected-system-design)
-4. [Component Responsibilities](#component-responsibilities)
-5. [Data Flow Diagrams](#data-flow-diagrams)
-6. [Event Lifecycle](#event-lifecycle)
-7. [Dual-Output Architecture](#dual-output-architecture)
-8. [DJ Integration Without Blocking](#dj-integration-without-blocking)
-9. [Future Scalability](#future-scalability)
+Appalachia Radio is an automated radio station that plays music with intelligent weighted selection, integrates DJ segments (intros/outros/talk), and simultaneously broadcasts to FM transmitter (primary) and YouTube Live (secondary). The system is designed for reliability: FM output must continue even if YouTube streaming fails.
 
----
+**Key Capabilities:**
+- Weighted random song selection with play history tracking
+- Non-blocking DJ segment integration
+- Dual output: FM (always active) + YouTube (optional, non-blocking)
+- Frame-based audio processing for low latency
+- Graceful restart with state persistence
 
-## System Overview
-
-The Radio Broadcast System is an automated radio station that:
-- Plays music with intelligent weighted selection based on play history
-- Integrates DJ intros/outros and talk segments
-- Simultaneously outputs to FM transmitter (primary) and YouTube Live (secondary)
-- Ensures FM broadcast continues even if YouTube streaming fails
-
-### Key Requirements
-
-1. **Music Playback**: Weighted random selection with play history tracking
-2. **DJ System**: Separate, non-blocking system for intros, outros, and talk segments
-3. **Dual Output**: 
-   - FM transmitter (always active, critical path)
-   - YouTube Live stream (optional, must not block FM if offline)
-4. **Resilience**: Local FM output must work independently of internet connectivity
+**Architecture Philosophy:**
+- Separation of concerns: six independent layers
+- Frame-based processing: no full-file loading
+- Event-driven playout: queue-based scheduling
+- Sink independence: FM failure is fatal, YouTube failure is non-blocking
 
 ---
 
-## 🔒 Locked-In Implementation Decisions
+## 2. Core Principles (Non-Negotiable)
 
-**These decisions are final and must be implemented exactly as specified:**
+1. **Frame-Based Architecture**: All audio processing operates on frame chunks (4096-8192 bytes), never full files
+2. **FM Primary**: FM output is the critical path; YouTube is optional and must not block FM
+3. **Non-Blocking Design**: DJ decisions and YouTube streaming must not block music playback
+4. **Event Queue Model**: All playback is driven by an event queue (intro → song → outro)
+5. **Pure Logic Separation**: Music selection and DJ logic are pure functions with no playback knowledge
+6. **Explicit Interfaces**: Components communicate via well-defined interfaces, not implementation details
 
-### 1. Audio Decoder: FFmpeg Pipe Output (LOCKED IN)
+---
+
+## 3. High-Level System Overview
+
+### 3.1 System Layers
+
+```
+┌─────────────────────────────────────────┐
+│         app/radio.py                    │
+│    (Thin Orchestration Shell)           │
+└─────────────────┬───────────────────────┘
+                  │
+    ┌─────────────┼─────────────┐
+    │             │             │
+    ▼             ▼             ▼
+┌─────────┐  ┌─────────┐  ┌──────────────┐
+│ music_  │  │ dj_     │  │ broadcast_   │
+│ logic/  │  │ logic/  │  │ core/        │
+│         │  │         │  │              │
+│ Playlist│  │ DJEngine│  │ PlayoutEngine│
+│ Manager │  │ Rules   │  │ EventQueue   │
+└─────────┘  └────┬────┘  └──────┬───────┘
+                  │              │
+                  └──────┬────────┘
+                         ▼
+                  ┌──────────────┐
+                  │   mixer/     │
+                  │              │
+                  │ MP3→PCM      │
+                  │ Frame Proc   │
+                  └──────┬───────┘
+                         │
+          ┌───────────────┼───────────────┐
+          │               │               │
+          ▼               ▼               ▼
+    ┌─────────┐    ┌──────────┐    ┌──────────┐
+    │ FMSink  │    │YouTubeSink│    │ (Future) │
+    │(Primary)│    │(Optional) │    │  Sink    │
+    └─────────┘    └──────────┘    └──────────┘
+```
+
+### 3.2 Directory Structure
+
+```
+appalachia-radio/
+├── app/
+│   └── radio.py              # Orchestration only
+├── music_logic/
+│   ├── playlist_manager.py   # Selection & history
+│   └── library_manager.py    # File discovery
+├── dj_logic/
+│   ├── dj_engine.py          # DJ orchestration
+│   └── (rules, cadence, matching)
+├── broadcast_core/
+│   ├── playout_engine.py     # Event scheduler
+│   ├── event_queue.py        # Thread-safe queue
+│   └── state_machine.py      # Playback states
+├── mixer/
+│   ├── audio_decoder.py      # FFmpeg MP3→PCM
+│   └── audio_mixer.py        # Frame processing
+├── outputs/
+│   ├── fm_sink.py            # ALSA output
+│   ├── youtube_sink.py       # RTMP stream
+│   └── sink_base.py          # Abstract base
+└── clock/
+    └── master_clock.py        # Timing engine
+```
+
+### 3.3 Legacy vs. New Architecture
+
+**Legacy System** (`radio/radio.py`):
+- Monolithic `MusicPlayer` class
+- DJ logic embedded in playback loop
+- Tight coupling between components
+- Single-threaded blocking operations
+
+**New Architecture**:
+- Six independent layers with clear boundaries
+- DJ logic as separate recommendation system
+- Event-driven, non-blocking design
+- Frame-based processing for low latency
+
+---
+
+## 4. Locked-In Architecture Decisions
+
+**These decisions are final and must be implemented exactly as specified.**
+
+### 4.1 Audio Decoder: FFmpeg Pipe Output
 
 **Decision**: Use FFmpeg subprocess with raw PCM pipe output.
 
-**Implementation**:
-- **Command**: `ffmpeg -i input.mp3 -f s16le -ac 2 -ar 48000 pipe:1`
-  - `-f s16le`: 16-bit signed little-endian PCM
-  - `-ac 2`: Stereo (2 channels)
-  - `-ar 48000`: 48kHz sample rate
-  - `pipe:1`: Output raw PCM bytes to stdout
-- **Interface**: Streaming generator that yields PCM frame chunks
-- **Frame Size**: 4096-8192 bytes per frame (configurable)
-- **Rationale**: Stable, low CPU, works with all formats, perfect for live streaming
+**Exact Implementation**:
+```bash
+ffmpeg -i input.mp3 -f s16le -ac 2 -ar 48000 pipe:1
+```
+- `-f s16le`: 16-bit signed little-endian PCM
+- `-ac 2`: Stereo (2 channels)
+- `-ar 48000`: 48kHz sample rate
+- `pipe:1`: Output raw PCM bytes to stdout
 
-**Rejected Alternatives**:
-- ❌ pydub: Loads entire file into memory (bad for live streaming)
-- ❌ python-vlc: Unpredictable latency and drift
+**Interface**: Streaming generator that yields PCM frame chunks (4096-8192 bytes)
 
-### 2. Frame-Based Architecture (LOCKED IN)
+**Rationale**: Stable, low CPU, works with all formats, perfect for live streaming
+
+**Rejected**: ❌ pydub (loads entire file), ❌ python-vlc (unpredictable latency)
+
+### 4.2 Frame-Based Architecture
 
 **Decision**: Entire audio pipeline operates on frame chunks, not full files.
 
-**Implementation**:
-- **Decoder**: `for frame in decoder.stream_frames(): yield frame`
-- **Mixer**: `mixer.push_frame(frame)` → processes → outputs to sinks
-- **Sinks**: `sink.write_frame(frame)` - receives frame chunks
-- **Frame Size**: 4096-8192 bytes (typically ~46-92ms of audio at 48kHz stereo)
+**Flow**:
+- Decoder: `for frame in decoder.stream_frames(): yield frame`
+- Mixer: `mixer.push_frame(frame)` → processes → outputs to sinks
+- Sinks: `sink.write_frame(frame)` receives frame chunks
 
-**Benefits**:
-- Low latency (no need to decode entire file)
-- Memory efficient (only small buffers in memory)
-- Real-time processing (suitable for live streaming)
+**Frame Size**: 4096-8192 bytes (~46-92ms of audio at 48kHz stereo)
 
-**Rejected Approach**: ❌ Loading full PCM files into memory
+**Benefits**: Low latency, memory efficient, real-time processing
 
-### 3. PlayoutEngine Interface (LOCKED IN)
+### 4.3 PlayoutEngine Interface
 
-**Decision**: Explicit, minimal interface for PlayoutEngine.
-
-**Implementation**:
+**Exact Interface** (must match exactly):
 ```python
 class PlayoutEngine:
     def queue_event(self, event: AudioEvent) -> None:
         """Add an audio event to the playout queue."""
         
     def run(self) -> None:
-        """Main non-blocking loop that ticks mixer and processes events."""
+        """Main non-blocking loop that processes events."""
         
     def current_state(self) -> PlaybackState:
         """Get current playback state."""
+        
+    def is_idle(self) -> bool:
+        """Check if engine is idle (no events playing)."""
 ```
 
-**AudioEvent Definition**:
+### 4.4 AudioEvent Definition
+
+**Exact Structure** (must match exactly):
 ```python
 from dataclasses import dataclass
 from typing import Literal
@@ -101,293 +180,140 @@ class AudioEvent:
     gain: float = 1.0     # Volume gain multiplier (0.0-1.0)
 ```
 
-**Rationale**: Clear, minimal interface prevents implementation assumptions and ensures testability.
+### 4.5 SinkBase Interface
 
----
-
----
-
-## Current Architecture
-
-### Current Structure
-
-The existing system (`radio/radio.py`) uses a monolithic `MusicPlayer` class that:
-- Orchestrates all components (playlist, DJ, audio, YouTube)
-- Embeds DJ logic directly in the playback loop
-- Uses a pipe-based audio system for dual output
-- Handles YouTube streaming as an optional component
-
-**Current Components:**
-- `MusicPlayer`: Main orchestrator
-- `PlaylistManager`: Song selection and history tracking
-- `DJManager`: DJ file discovery and caching
-- `PipeAudioPlayer`: MP3 decoding to named pipe
-- `ALSAOutputManager`: Reads pipe, outputs to FM transmitter
-- `YouTubeStreamer`: Reads pipe, streams to YouTube Live
-
-**Current Limitations:**
-- DJ logic is embedded in music playback (tight coupling)
-- No clear separation between selection logic and playout
-- Single-threaded blocking operations
-- Limited extensibility for future features
-
----
-
-## Rearchitected System Design
-
-### High-Level Architecture
-
-The rearchitected system separates concerns into six independent layers:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    /app/radio.py                            │
-│              (Thin Orchestration Shell)                      │
-└─────────────────────────────────────────────────────────────┘
-                            │
-        ┌───────────────────┼───────────────────┐
-        │                   │                   │
-        ▼                   ▼                   ▼
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐
-│ music_logic/ │   │  dj_logic/   │   │broadcast_core│
-│              │   │              │   │              │
-│ PlaylistMgr  │   │  DJEngine    │   │ PlayoutEngine│
-│ SongHistory  │   │  Rules/Cadence│  │  Queue/State │
-│ Probabilities│   │  Track Match │   │  Scheduling  │
-└──────────────┘   └──────────────┘   └──────────────┘
-                            │                   │
-                            └─────────┬─────────┘
-                                      ▼
-                            ┌──────────────┐
-                            │   mixer/     │
-                            │              │
-                            │ MP3→PCM      │
-                            │ Ducking      │
-                            │ Crossfade    │
-                            └──────────────┘
-                                      │
-                    ┌─────────────────┴─────────────────┐
-                    │                                   │
-                    ▼                                   ▼
-            ┌──────────────┐                   ┌──────────────┐
-            │  outputs/    │                   │  outputs/    │
-            │              │                   │              │
-            │   FMSink     │                   │ YouTubeSink  │
-            │ (Always On)  │                   │ (Optional)   │
-            └──────────────┘                   └──────────────┘
-```
-
-### Directory Structure
-
-```
-appalachia-radio/
-├── app/
-│   └── radio.py              # Thin orchestration shell
-├── music_logic/
-│   ├── __init__.py
-│   ├── playlist_manager.py   # PlaylistManager (existing, refactored)
-│   ├── song_history.py       # History tracking & weighted selection
-│   └── probability_engine.py # Weight calculation algorithms
-├── dj_logic/
-│   ├── __init__.py
-│   ├── dj_engine.py          # DJEngine (rewritten from DJManager)
-│   ├── rules_engine.py       # Rules for when to play DJ segments
-│   ├── cadence_manager.py    # Timing and cadence logic
-│   └── track_matcher.py      # Match DJ files to songs
-├── broadcast_core/
-│   ├── __init__.py
-│   ├── playout_engine.py     # PlayoutEngine (non-blocking)
-│   ├── event_queue.py        # Queue of audio events
-│   └── state_machine.py      # Playback state management
-├── mixer/
-│   ├── __init__.py
-│   ├── audio_decoder.py      # MP3 → PCM conversion (FFmpeg pipe, LOCKED IN)
-│   ├── audio_mixer.py        # Frame-based mixing, ducking, crossfade
-│   └── pcm_buffer.py         # PCM frame buffer management
-├── outputs/
-│   ├── __init__.py
-│   ├── fm_sink.py            # FMSink (always active)
-│   ├── youtube_sink.py       # YouTubeSink (optional, reconnects)
-│   └── sink_base.py          # Base class for audio sinks
-└── ARCHITECTURE.md           # This file
+**Exact Interface** (must match exactly):
+```python
+class SinkBase(ABC):
+    @abstractmethod
+    def write_frame(self, pcm_frame: bytes) -> None:
+        """Write a single PCM frame chunk to the sink."""
+        
+    @abstractmethod
+    def start(self) -> bool:
+        """Start the sink (e.g., open device, connect stream)."""
+        
+    @abstractmethod
+    def stop(self) -> None:
+        """Stop the sink (e.g., close device, disconnect stream)."""
 ```
 
 ---
 
-## Component Responsibilities
+## 5. System Components & Responsibilities
 
-### 1. music_logic/
+### 5.1 Music Logic Layer (`music_logic/`)
 
 **Purpose**: Pure music selection logic with no knowledge of playback or DJ.
+
+**Components**:
 
 #### PlaylistManager
 - Maintains play history (last N songs with timestamps)
 - Tracks play counts per song
-- Calculates weighted probabilities for song selection
-- Handles holiday season detection and probability
-- No direct file I/O (receives file lists from outside)
+- Calculates weighted probabilities for selection
+- Handles holiday season detection
+- **No direct file I/O** (receives file lists from LibraryManager)
 
-#### SongHistory
-- Manages play history queue
-- Provides time-based queries (e.g., "songs played in last hour")
-- Calculates recency penalties
-- Tracks never-played songs
+#### LibraryManager
+- Discovers music files (regular + holiday)
+- Provides file lists to PlaylistManager
+- Handles directory scanning and caching
 
-#### ProbabilityEngine
-- Implements weighting algorithms:
-  - Recent play penalty (queue-like system)
-  - Time-based bonus (old songs get priority)
-  - Never-played bonus
-  - Play count balance
-- Normalizes probabilities for random selection
+**Key Principle**: Pure functions—take inputs (file lists, history) and return selection probabilities. No side effects.
 
-**Key Principle**: These components are pure functions - they take inputs (file lists, history) and return selection probabilities. No side effects.
+### 5.2 DJ Logic Layer (`dj_logic/`)
 
----
+**Purpose**: Independent system for DJ segment decision-making.
 
-### 2. dj_logic/
-
-**Purpose**: Independent system for DJ segment decision-making and management.
+**Components**:
 
 #### DJEngine
 - Main orchestrator for DJ system
 - Decides when to play intros, outros, or talk segments
 - Manages DJ file discovery and caching
-- Coordinates with rules engine and cadence manager
 - Provides non-blocking API: "Should I play a DJ segment now?"
 
-#### RulesEngine
-- Implements rules for DJ segment selection:
-  - Dynamic probability (increases over time)
-  - Track attribute matching (genre, mood, etc.)
-  - Time-of-day rules
-  - Special event rules
+#### Rules Engine
+- Dynamic probability (increases over time)
+- Track attribute matching (genre, mood, etc.)
+- Time-of-day rules
 - Returns recommendations, not commands
 
-#### CadenceManager
-- Manages timing and cadence:
-  - Minimum time between DJ segments
-  - Maximum DJ segment frequency
-  - Intro vs outro preference logic
-  - Talk segment scheduling
+#### Cadence Manager
+- Minimum time between DJ segments
+- Maximum DJ segment frequency
+- Intro vs outro preference logic
 
-#### TrackMatcher
-- Matches DJ files to songs:
-  - Intro/outro file discovery
-  - Multiple variant support (intro1, intro2, etc.)
-  - Fallback logic
+#### Track Matcher
+- Matches DJ files to songs
+- Multiple variant support (intro1, intro2, etc.)
+- Fallback logic
 - Caches file lists for performance
 
-**Key Principle**: DJ logic is completely separate from music playback. It provides recommendations that the playout engine can accept or reject.
+**Key Principle**: DJ logic is completely separate from music playback. Provides recommendations that playout engine can accept or reject.
 
----
-
-### 3. broadcast_core/
+### 5.3 Playout Core (`broadcast_core/`)
 
 **Purpose**: Non-blocking playout scheduling and state management.
 
+**Components**:
+
 #### PlayoutEngine
-- **Explicit Interface** (LOCKED IN):
-  ```python
-  class PlayoutEngine:
-      def queue_event(self, event: AudioEvent) -> None:
-          """Add an audio event to the playout queue."""
-          
-      def run(self) -> None:
-          """Main non-blocking loop that ticks mixer and processes events."""
-          
-      def current_state(self) -> PlaybackState:
-          """Get current playback state."""
-  ```
 - Manages queue of audio events (intro → song → outro)
 - Non-blocking scheduler that continuously processes events
-- State machine for playback states:
+- Coordinates with mixer for audio delivery (frame-by-frame)
+- Handles event timing and transitions
+
+#### EventQueue
+- Thread-safe queue of `AudioEvent` objects
+- Event types: `"song"`, `"intro"`, `"outro"`, `"talk"`
+- Priority handling (DJ segments can interrupt)
+
+#### StateMachine
+- Manages playback state transitions:
   - `IDLE`: No audio playing
   - `PLAYING_INTRO`: Playing DJ intro segment
   - `PLAYING_SONG`: Playing music track
   - `PLAYING_OUTRO`: Playing DJ outro segment
   - `TRANSITIONING`: Crossfading between tracks
-- Coordinates with mixer for audio delivery (frame-by-frame)
-- Handles event timing and transitions
-
-#### EventQueue
-- Thread-safe queue of audio events
-- **AudioEvent Definition** (LOCKED IN):
-  ```python
-  from dataclasses import dataclass
-  from typing import Literal
-  
-  @dataclass
-  class AudioEvent:
-      path: str              # File path to audio file
-      type: Literal["song", "intro", "outro", "talk"]  # Event type
-      gain: float = 1.0     # Volume gain multiplier (0.0-1.0)
-  ```
-- Event types map to `AudioEvent.type`:
-  - `"song"`: Music track to play
-  - `"intro"`: DJ intro segment
-  - `"outro"`: DJ outro segment
-  - `"talk"`: Standalone DJ talk segment
-- Priority handling (DJ segments can interrupt)
-- Event metadata (duration, fade points, etc.) - may be extended in future
-
-#### StateMachine
-- Manages playback state transitions
+  - `ERROR`: Error state
 - Ensures valid state sequences
-- Handles error states and recovery
 - Provides state change callbacks
 
-**Key Principle**: PlayoutEngine is a scheduler, not a player. It doesn't decode audio or output sound - it manages what should play when.
+**Key Principle**: PlayoutEngine is a scheduler, not a player. It doesn't decode audio or output sound—it manages what should play when.
 
----
-
-### 4. mixer/
+### 5.4 Mixer Layer (`mixer/`)
 
 **Purpose**: Audio processing and format conversion.
 
+**Components**:
+
 #### AudioDecoder
 - **Implementation**: FFmpeg subprocess with pipe output (LOCKED IN)
-- **Command Format**: `ffmpeg -i input.mp3 -f s16le -ac 2 -ar 48000 pipe:1`
-  - `-f s16le`: 16-bit signed little-endian PCM format
-  - `-ac 2`: 2 channels (stereo)
-  - `-ar 48000`: 48kHz sample rate
-  - `pipe:1`: Output to stdout as raw PCM bytes
+- **Command**: `ffmpeg -i input.mp3 -f s16le -ac 2 -ar 48000 pipe:1`
 - **Interface**: Streaming generator that yields PCM frame chunks
-- **Frame Size**: Configurable (typically 4096-8192 bytes per frame)
+- **Frame Size**: 4096-8192 bytes per frame (configurable)
 - **Error Handling**: Handles corrupted files, missing files, FFmpeg process failures
-- **Why FFmpeg**: Stable, low CPU usage, works with all audio formats, perfect for live streaming
 
 #### AudioMixer
-- **Frame-Based Architecture**: Processes and outputs PCM frames/chunks, not full files
-- **Streaming Interface**: 
+- **Frame-Based Architecture**: Processes and outputs PCM frames/chunks
+- **Streaming Interface**:
   - Receives frames from decoder: `mixer.push_frame(frame)`
   - Outputs frames to sinks: `sink.write_frame(frame)`
 - **Frame Processing**:
   - Mixes multiple audio sources (future: voice ducking)
   - Applies crossfade between tracks (frame-by-frame)
   - Handles volume normalization per frame
-  - Manages audio effects (compression, EQ - future)
 - **Continuous Stream**: Outputs frame chunks continuously, maintaining low latency
-- **Frame Size**: Matches decoder output (typically 4096-8192 bytes)
-
-#### PCMBuffer
-- Manages PCM frame buffers
-- Handles buffer underrun/overrun
-- Provides thread-safe read/write operations
-- Manages buffer size and latency
 
 **Key Principle**: Mixer is the only component that touches audio files. All other components work with metadata and file paths.
 
-**Frame-Based Architecture**: The entire audio pipeline operates on frame chunks, not full files. This enables:
-- Low latency (no need to decode entire file before playback)
-- Memory efficiency (only small buffers in memory)
-- Real-time processing (suitable for live streaming)
-
----
-
-### 5. outputs/
+### 5.5 Output Sinks (`outputs/`)
 
 **Purpose**: Audio output sinks that consume PCM streams.
+
+**Components**:
 
 #### FMSink
 - Always active (critical path)
@@ -407,21 +333,6 @@ appalachia-radio/
 
 #### SinkBase
 - Abstract base class for all sinks
-- **Interface** (LOCKED IN):
-  ```python
-  class SinkBase(ABC):
-      @abstractmethod
-      def write_frame(self, pcm_frame: bytes) -> None:
-          """Write a single PCM frame chunk to the sink."""
-          
-      @abstractmethod
-      def start(self) -> bool:
-          """Start the sink (e.g., open device, connect stream)."""
-          
-      @abstractmethod
-      def stop(self) -> None:
-          """Stop the sink (e.g., close device, disconnect stream)."""
-  ```
 - Handles common functionality:
   - Frame buffer management
   - Error recovery
@@ -430,290 +341,87 @@ appalachia-radio/
 
 **Key Principle**: Sinks are independent consumers. FMSink failure is fatal, YouTubeSink failure is non-blocking.
 
----
-
-### 6. /app/radio.py
+### 5.6 Orchestration Layer (`app/radio.py`)
 
 **Purpose**: Thin orchestration shell that wires everything together.
 
-**Responsibilities:**
+**Responsibilities**:
 - Initialize all components
 - Wire up data flow between layers
-- Handle system signals (SIGTERM, etc.)
-- Provide main event loop (if needed)
+- Handle system signals (SIGTERM, SIGUSR1 for graceful restart)
+- Provide main event loop
 - Logging and monitoring coordination
+- PID file management
+- State persistence (playlist history)
 
-**What it does NOT do:**
-- No business logic
-- No audio processing
-- No file I/O (beyond initialization)
-- No state management
-
-**Example Structure:**
-```python
-def main():
-    # Initialize components
-    playlist_mgr = PlaylistManager()
-    dj_engine = DJEngine()
-    playout_engine = PlayoutEngine()
-    mixer = AudioMixer()
-    fm_sink = FMSink()
-    youtube_sink = YouTubeSink()  # Optional
-    
-    # Wire up data flow
-    playout_engine.set_mixer(mixer)
-    mixer.add_sink(fm_sink)
-    if youtube_enabled:
-        mixer.add_sink(youtube_sink)
-    
-    # Start components
-    fm_sink.start()
-    if youtube_enabled:
-        youtube_sink.start()
-    playout_engine.start()
-    
-    # Main loop: request songs and let playout engine handle it
-    while True:
-        # Get song recommendation from music_logic
-        song = playlist_mgr.select_next_song()
-        
-        # Check if DJ wants to add segments
-        dj_events = dj_engine.should_play_segments(song)
-        
-        # Queue events in playout engine
-        playout_engine.queue_events(dj_events + [song])
-        
-        # Wait for current queue to finish
-        playout_engine.wait_for_queue_empty()
-```
+**What it does NOT do**:
+- ❌ No business logic
+- ❌ No audio processing
+- ❌ No file I/O (beyond initialization)
+- ❌ No state management
 
 ---
 
-## Data Flow Diagrams
+## 6. Playback Lifecycle + Event Flow
 
-### Overall System Flow
-
-```
-┌─────────────┐
-│ music_logic │
-│             │──[Song Selection]──┐
-└─────────────┘                    │
-                                   ▼
-┌─────────────┐              ┌──────────────┐
-│  dj_logic   │──[DJ Events]─┤broadcast_core│
-│             │              │              │
-└─────────────┘              │ PlayoutEngine│
-                             └──────┬───────┘
-                                    │
-                           [Event Queue]
-                                    │
-                                    ▼
-                             ┌──────────┐
-                             │  mixer/  │
-                             │          │
-                             │ MP3→PCM  │
-                             └────┬─────┘
-                                  │
-                    ┌─────────────┼─────────────┐
-                    │             │             │
-                    ▼             ▼             ▼
-              ┌─────────┐  ┌──────────┐  ┌──────────┐
-              │FMSink   │  │YouTubeSink│  │(Future)  │
-              │(PCM)    │  │  (PCM)    │  │  Sink    │
-              └─────────┘  └──────────┘  └──────────┘
-```
-
-### Song Selection Flow
-
-```
-FileManager
-    │
-    ├─[Regular Files]──┐
-    │                  │
-    └─[Holiday Files]───┤
-                       ▼
-              ┌─────────────────┐
-              │ PlaylistManager │
-              │                 │
-              │ • Get history   │
-              │ • Calculate     │
-              │   probabilities │
-              │ • Apply weights │
-              └────────┬────────┘
-                       │
-                       ▼
-              ┌─────────────────┐
-              │ ProbabilityEngine│
-              │                 │
-              │ • Recent penalty │
-              │ • Time bonus     │
-              │ • Play count     │
-              │ • Normalize     │
-              └────────┬────────┘
-                       │
-                       ▼
-              [Selected Song]
-```
-
-### DJ Decision Flow
-
-```
-PlayoutEngine
-    │
-    ├─[Current Song]──┐
-    │                 │
-    └─[State]─────────┤
-                      ▼
-            ┌─────────────────┐
-            │   DJEngine      │
-            │                 │
-            │ 1. Check rules  │
-            │ 2. Check cadence│
-            │ 3. Match files  │
-            └────────┬────────┘
-                     │
-         ┌───────────┼───────────┐
-         │           │           │
-         ▼           ▼           ▼
-    ┌────────┐ ┌─────────┐ ┌─────────┐
-    │ Rules  │ │ Cadence │ │ Matcher │
-    │ Engine │ │ Manager │ │         │
-    └────────┘ └─────────┘ └─────────┘
-         │           │           │
-         └───────────┼───────────┘
-                     │
-                     ▼
-            [DJ Event or None]
-```
-
-### Audio Processing Flow
-
-```
-PlayoutEngine
-    │
-    ├─[Event: song.mp3]──┐
-    │                    │
-    └─[Event: intro.mp3]─┤
-                         ▼
-                ┌──────────────┐
-                │ AudioDecoder │
-                │              │
-                │ MP3 → PCM    │
-                │ (FFmpeg pipe)│
-                │ stream_frames│
-                └──────┬───────┘
-                       │
-                  [PCM Frames]
-                       │
-                       ▼
-                ┌──────────────┐
-                │  AudioMixer  │
-                │              │
-                │ • Crossfade  │
-                │ • Ducking    │
-                │ • Normalize  │
-                │ push_frame() │
-                └──────┬───────┘
-                       │
-                  [PCM Frames]
-                       │
-         ┌─────────────┼─────────────┐
-         │             │             │
-         ▼             ▼             ▼
-    ┌─────────┐  ┌──────────┐  ┌──────────┐
-    │FMSink   │  │YouTubeSink│  │(Future)  │
-    │         │  │          │  │          │
-    │write()  │  │ write()  │  │ write()  │
-    │ ALSA    │  │  RTMP    │  │  File    │
-    └─────────┘  └──────────┘  └──────────┘
-```
-
----
-
-## Event Lifecycle
-
-### Complete Playback Cycle
+### 6.1 Complete Playback Cycle
 
 ```
 1. SONG SELECTION
-   ┌─────────────────────────────────────┐
-   │ music_logic/PlaylistManager         │
-   │ • Get file lists from FileManager   │
-   │ • Calculate probabilities           │
-   │ • Select song using weighted random │
-   └──────────────┬──────────────────────┘
-                  │
-                  ▼
+   music_logic/PlaylistManager
+   • Get file lists from LibraryManager
+   • Calculate probabilities
+   • Select song using weighted random
+   │
+   ▼
 2. DJ DECISION
-   ┌─────────────────────────────────────┐
-   │ dj_logic/DJEngine                   │
-   │ • Check if intro should play        │
-   │ • Check if outro should play        │
-   │ • Match DJ files to song            │
-   └──────────────┬──────────────────────┘
-                  │
-                  ▼
+   dj_logic/DJEngine
+   • Check if intro should play
+   • Check if outro should play
+   • Match DJ files to song
+   │
+   ▼
 3. EVENT QUEUE BUILDING
-   ┌─────────────────────────────────────┐
-   │ broadcast_core/PlayoutEngine        │
-   │ • Create AudioEvent objects:         │
-   │   AudioEvent(path, "intro", 1.0)? →  │
-   │   AudioEvent(path, "song", 1.0) →    │
-   │   AudioEvent(path, "outro", 1.0)?    │
-   │ • queue_event() for each event       │
-   │ • run() loop processes queue         │
-   └──────────────┬───────────────────────┘
-                  │
-                  ▼
+   broadcast_core/PlayoutEngine
+   • Create AudioEvent objects:
+     AudioEvent(path, "intro", 1.0)? →
+     AudioEvent(path, "song", 1.0) →
+     AudioEvent(path, "outro", 1.0)?
+   • queue_event() for each event
+   • run() loop processes queue
+   │
+   ▼
 4. AUDIO DECODING
-   ┌─────────────────────────────────────┐
-   │ mixer/AudioDecoder                   │
-   │ • FFmpeg: -f s16le -ac 2 -ar 48000   │
-   │ • Decode MP3 → raw PCM bytes         │
-   │ • Stream frame chunks (4096-8192B)   │
-   │ • Yield frames to AudioMixer         │
-   └──────────────┬───────────────────────┘
-                  │
-            [PCM Frame Chunks]
-                  │
-                  ▼
+   mixer/AudioDecoder
+   • FFmpeg: -f s16le -ac 2 -ar 48000
+   • Decode MP3 → raw PCM bytes
+   • Stream frame chunks (4096-8192B)
+   • Yield frames to AudioMixer
+   │
+   ▼
 5. AUDIO MIXING
-   ┌─────────────────────────────────────┐
-   │ mixer/AudioMixer                     │
-   │ • Receive frames: push_frame(frame)  │
-   │ • Apply crossfade (if transitioning)│
-   │ • Apply ducking (if DJ talking)      │
-   │ • Normalize volume per frame         │
-   │ • Output frame chunks to sinks       │
-   └──────────────┬───────────────────────┘
-                  │
-            [PCM Frame Chunks]
-                  │
-                  │
-         ┌────────┼────────┐
-         │        │        │
-         ▼        ▼        ▼
+   mixer/AudioMixer
+   • Receive frames: push_frame(frame)
+   • Apply crossfade (if transitioning)
+   • Apply ducking (if DJ talking)
+   • Normalize volume per frame
+   • Output frame chunks to sinks
+   │
+   ▼
 6. OUTPUT DELIVERY
-   ┌─────────┐ ┌──────────┐ ┌──────────┐
-   │FMSink   │ │YouTubeSink│ │(Future)  │
-   │         │ │          │ │          │
-   │ ALSA    │ │  RTMP    │ │  File    │
-   │ Device  │ │  Stream  │ │  Record  │
-   └────┬────┘ └────┬─────┘ └────┬─────┘
-        │           │            │
-        └───────────┼────────────┘
-                    │
-                    ▼
+   outputs/FMSink + YouTubeSink
+   • FMSink: ALSA device (always)
+   • YouTubeSink: RTMP stream (optional)
+   │
+   ▼
 7. HISTORY UPDATE
-   ┌─────────────────────────────────────┐
-   │ music_logic/PlaylistManager         │
-   │ • Update play history                │
-   │ • Increment play count               │
-   │ • Update DJ talk counter             │
-   └─────────────────────────────────────┘
+   music_logic/PlaylistManager
+   • Update play history
+   • Increment play count
+   • Save state to disk (for graceful restart)
 ```
 
-### State Machine Transitions
+### 6.2 State Machine Transitions
 
 ```
 [IDLE]
@@ -741,25 +449,123 @@ PlayoutEngine
   └─ transition_complete ──► [PLAYING_SONG]
 ```
 
+### 6.3 Data Flow Diagram
+
+```
+┌─────────────┐
+│ music_logic │──[Song Selection]──┐
+└─────────────┘                    │
+                                   ▼
+┌─────────────┐              ┌──────────────┐
+│  dj_logic   │──[DJ Events]─┤broadcast_core│
+│             │              │              │
+└─────────────┘              │ PlayoutEngine│
+                             └──────┬───────┘
+                                    │
+                           [Event Queue]
+                                    │
+                                    ▼
+                             ┌──────────┐
+                             │  mixer/  │
+                             │          │
+                             │ MP3→PCM  │
+                             └────┬─────┘
+                                  │
+                    ┌─────────────┼─────────────┐
+                    │             │             │
+                    ▼             ▼             ▼
+              ┌─────────┐  ┌──────────┐  ┌──────────┐
+              │FMSink   │  │YouTubeSink│  │(Future)  │
+              │(PCM)    │  │  (PCM)    │  │  Sink    │
+              └─────────┘  └──────────┘  └──────────┘
+```
+
 ---
 
-## Dual-Output Architecture
+## 7. Audio Pipeline & PCM Frame Architecture
 
-### Key Design Principles
+### 7.1 Frame-Based Processing Flow
+
+```
+PlayoutEngine
+    │
+    ├─[Event: song.mp3]──┐
+    │                    │
+    └─[Event: intro.mp3]─┤
+                         ▼
+                ┌──────────────┐
+                │ AudioDecoder │
+                │              │
+                │ MP3 → PCM    │
+                │ (FFmpeg pipe)│
+                │ stream_frames│
+                └──────┬───────┘
+                       │
+                  [PCM Frames]
+                  (4096-8192B)
+                       │
+                       ▼
+                ┌──────────────┐
+                │  AudioMixer  │
+                │              │
+                │ • Crossfade  │
+                │ • Ducking    │
+                │ • Normalize  │
+                │ push_frame() │
+                └──────┬───────┘
+                       │
+                  [PCM Frames]
+                       │
+         ┌─────────────┼─────────────┐
+         │             │             │
+         ▼             ▼             ▼
+    ┌─────────┐  ┌──────────┐  ┌──────────┐
+    │FMSink   │  │YouTubeSink│  │(Future)  │
+    │         │  │          │  │          │
+    │write()  │  │ write()  │  │ write()  │
+    │ ALSA    │  │  RTMP    │  │  File    │
+    └─────────┘  └──────────┘  └──────────┘
+```
+
+### 7.2 Frame Size & Timing
+
+- **Frame Size**: 4096-8192 bytes per frame
+- **Duration**: ~46-92ms of audio at 48kHz stereo
+- **Processing**: One frame per MasterClock tick (~21.333ms for 4096-byte frames)
+- **Memory**: Only small buffers in memory (no full-file loading)
+
+### 7.3 Frame Buffer Management
+
+- **FMSink**: Synchronous frame writes (blocks until written to ALSA)
+  - No internal buffering—direct write to device
+  - Frame drops are fatal (indicates device problem)
+- **YouTubeSink**: Asynchronous frame writes with internal buffer
+  - Internal ring buffer (e.g., 1-2 seconds of audio)
+  - If buffer full, drop oldest frames (don't block mixer)
+  - Maintains quality when connected, degrades gracefully when disconnected
+- **Mixer**: Processes one frame at a time
+  - Receives frame from decoder → processes → outputs to all sinks
+  - No accumulation of full files in memory
+
+---
+
+## 8. Dual Output Redundancy Model (FM Primary, YouTube Secondary)
+
+### 8.1 Design Principles
 
 1. **FMSink is Primary**: Always active, critical path
 2. **YouTubeSink is Secondary**: Optional, must not block FM
 3. **Shared PCM Stream**: Both sinks consume from same mixer output
 4. **Independent Failure**: YouTube failure does not affect FM
 
-### Architecture Diagram
+### 8.2 Architecture
 
 ```
                     ┌──────────────┐
                     │ AudioMixer   │
                     │              │
                     │ Outputs PCM  │
-                    │   buffers    │
+                    │   frames     │
                     └──────┬───────┘
                            │
             ┌──────────────┼──────────────┐
@@ -769,15 +575,15 @@ PlayoutEngine
     │  FMSink     │ │ YouTubeSink │ │ (Future)    │
     │             │ │             │ │             │
     │ • Always on │ │ • Optional  │ │ • Extensible│
-    │ • ALSA      │ │ • RTMP       │ │             │
-    │ • Blocking  │ │ • Non-block  │ │             │
-    │   errors    │ │   on fail    │ │             │
-    │   are fatal │ │ • Auto-      │ │             │
-    │             │ │   reconnect  │ │             │
+    │ • ALSA      │ │ • RTMP      │ │             │
+    │ • Blocking  │ │ • Non-block │ │             │
+    │   errors    │ │   on fail   │ │             │
+    │   are fatal │ │ • Auto-     │ │             │
+    │             │ │   reconnect │ │             │
     └─────────────┘ └─────────────┘ └─────────────┘
 ```
 
-### Failure Handling
+### 8.3 Failure Handling
 
 #### FMSink Failure
 - **Detection**: ALSA device errors, process crashes
@@ -791,26 +597,11 @@ PlayoutEngine
 - **Impact**: None on FM output
 - **Recovery**: Background reconnection thread, periodic health checks
 
-### Implementation Strategy
+### 8.4 Implementation Pattern
 
 ```python
 class AudioMixer:
-    def __init__(self):
-        self.sinks = []
-        self.fm_sink = None  # Primary sink
-    
-    def add_sink(self, sink):
-        if isinstance(sink, FMSink):
-            self.fm_sink = sink
-        self.sinks.append(sink)
-    
     def push_frame(self, pcm_frame: bytes) -> None:
-        """
-        Process and output a single PCM frame chunk to all sinks.
-        
-        Args:
-            pcm_frame: Raw PCM frame bytes (typically 4096-8192 bytes)
-        """
         # Always write to FM sink first (critical path)
         if self.fm_sink:
             try:
@@ -831,36 +622,15 @@ class AudioMixer:
                     # Continue to other sinks
 ```
 
-### Frame-Based Buffer Management
-
-- **Frame Size**: Typically 4096-8192 bytes per frame (configurable)
-- **FMSink**: Synchronous frame writes (blocks until written to ALSA)
-  - No internal buffering - direct write to device
-  - Frame drops are fatal (indicates device problem)
-- **YouTubeSink**: Asynchronous frame writes with internal buffer
-  - Internal ring buffer (e.g., 1-2 seconds of audio)
-  - If buffer full, drop oldest frames (don't block mixer)
-  - Maintains quality when connected, degrades gracefully when disconnected
-- **Mixer**: Processes one frame at a time
-  - Receives frame from decoder → processes → outputs to all sinks
-  - No accumulation of full files in memory
-
 ---
 
-## DJ Integration Without Blocking
+## 9. DJ Integration Model (Non-Blocking, Plan-Per-Song)
 
-### Problem Statement
+### 9.1 Problem Statement
 
-In the current system, DJ logic is embedded in the music playback loop, causing:
-- Tight coupling between music and DJ systems
-- Blocking operations during DJ segment playback
-- Difficulty in extending DJ functionality
+DJ logic must not block music playback. Decisions should be fast (no file I/O in decision path) and recommendations should be optional (playout engine can accept/reject).
 
-### Solution: Event-Based Architecture
-
-DJ system operates independently and provides recommendations that the playout engine can accept or reject.
-
-### Design Pattern
+### 9.2 Design Pattern
 
 ```
 ┌──────────────┐
@@ -894,7 +664,7 @@ DJ system operates independently and provides recommendations that the playout e
 └──────────────┘
 ```
 
-### Non-Blocking Flow
+### 9.3 Non-Blocking Flow
 
 1. **PlayoutEngine requests DJ recommendation** (non-blocking call)
 2. **DJEngine evaluates rules** (fast, no I/O blocking)
@@ -902,136 +672,80 @@ DJ system operates independently and provides recommendations that the playout e
 4. **PlayoutEngine queues events** (intro → song → outro)
 5. **Audio processing happens asynchronously** (mixer handles decoding)
 
-### DJ Decision Timing
+### 9.4 DJ Decision Timing
 
+**Before Song:**
 ```
-Before Song:
-  ┌─────────────────┐
-  │ PlayoutEngine   │
-  │                 │
-  │ "Should I play  │
-  │  an intro?"     │
-  └────────┬────────┘
-           │
-           ▼
-  ┌─────────────────┐
-  │ DJEngine        │
-  │                 │
-  │ • Check prob    │
-  │ • Check cadence │
-  │ • Match files   │
-  │                 │
-  │ Returns:        │
-  │ • DJIntroEvent  │
-  │ • None          │
-  └────────┬────────┘
-           │
-           ▼
-  ┌─────────────────┐
-  │ PlayoutEngine   │
-  │                 │
-  │ Queue:          │
-  │ [intro?] → song │
-  └─────────────────┘
-
-After Song:
-  ┌─────────────────┐
-  │ PlayoutEngine   │
-  │                 │
-  │ "Should I play  │
-  │  an outro?"     │
-  │ (only if no     │
-  │  intro played)  │
-  └────────┬────────┘
-           │
-           ▼
-  ┌─────────────────┐
-  │ DJEngine        │
-  │                 │
-  │ • Check prob    │
-  │ • Check cadence │
-  │ • Match files   │
-  │                 │
-  │ Returns:        │
-  │ • DJOutroEvent  │
-  │ • None          │
-  └────────┬────────┘
-           │
-           ▼
-  ┌─────────────────┐
-  │ PlayoutEngine   │
-  │                 │
-  │ Queue:          │
-  │ song → [outro?] │
-  └─────────────────┘
+PlayoutEngine → "Should I play an intro?"
+DJEngine → Check prob, cadence, match files
+Returns: DJIntroEvent or None
+PlayoutEngine → Queue: [intro?] → song
 ```
 
-### Benefits
+**After Song:**
+```
+PlayoutEngine → "Should I play an outro?" (only if no intro played)
+DJEngine → Check prob, cadence, match files
+Returns: DJOutroEvent or None
+PlayoutEngine → Queue: song → [outro?]
+```
 
-1. **Separation of Concerns**: DJ logic is independent
-2. **Non-Blocking**: DJ decisions are fast (no file I/O in decision path)
-3. **Extensible**: Easy to add new DJ rules or segment types
-4. **Testable**: DJ logic can be tested independently
-5. **Flexible**: PlayoutEngine can accept/reject DJ recommendations
+### 9.5 Benefits
+
+- **Separation of Concerns**: DJ logic is independent
+- **Non-Blocking**: DJ decisions are fast (no file I/O in decision path)
+- **Extensible**: Easy to add new DJ rules or segment types
+- **Testable**: DJ logic can be tested independently
+- **Flexible**: PlayoutEngine can accept/reject DJ recommendations
 
 ---
 
-## Future Scalability
+## 10. Future Scalability Targets
 
-### Extensibility Points
+### 10.1 Performance Targets
 
-#### 1. Additional Output Sinks
+- **Song Library**: Support 10,000+ songs
+- **DJ Files**: Support 1,000+ DJ segments
+- **Concurrent Outputs**: Support 5+ simultaneous sinks
+- **Latency**: <100ms from event queue to audio output
+- **CPU Usage**: <20% on Raspberry Pi 4
 
-The sink architecture allows easy addition of new outputs:
+### 10.2 Extensibility Points
 
-```
-outputs/
-├── sink_base.py      # Abstract base class
-├── fm_sink.py        # FM transmitter
-├── youtube_sink.py   # YouTube Live
-├── icecast_sink.py   # Future: Icecast streaming
-├── file_sink.py      # Future: Local recording
-└── rtmp_sink.py      # Future: Generic RTMP
-```
+#### Additional Output Sinks
+- Icecast streaming
+- Local file recording
+- Generic RTMP sink
+- **Implementation**: Inherit from `SinkBase`, implement `write_frame()`, register with mixer
 
-**Implementation**: Inherit from `SinkBase`, implement `write_pcm_frames()`, register with mixer.
+#### Advanced Audio Processing
+- Voice ducking (automatically lower music when DJ talks)
+- Audio effects (compression, EQ, reverb)
+- Crossfade types (linear, exponential, custom curves)
+- Loudness normalization (EBU R128, ITU-R BS.1770)
 
-#### 2. Advanced Audio Processing
+#### DJ Rule Extensions
+- Time-of-day rules (different DJ behavior by hour)
+- Genre-based rules (match DJ segments to song genres)
+- Mood-based rules (match DJ segments to song mood)
+- Special events (holiday-specific rules, event calendars)
+- External triggers (API endpoints for manual DJ segments)
 
-The mixer layer can be extended with:
+#### Playout Features
+- Scheduled events (play specific songs at specific times)
+- Live interruptions (pause automation for live content)
+- Multiple playlists (different playlists for different times)
+- Ad insertion (commercial break support)
+- Emergency alerts (weather alerts, EAS integration)
 
-- **Voice Ducking**: Automatically lower music when DJ talks
-- **Audio Effects**: Compression, EQ, reverb
-- **Crossfade Types**: Linear, exponential, custom curves
-- **Loudness Normalization**: EBU R128, ITU-R BS.1770
+#### Monitoring and Analytics
+- Playback metrics (track what's playing, when, for how long)
+- DJ analytics (track DJ segment frequency and types)
+- Output health (monitor sink status and quality)
+- Listener analytics (track YouTube viewer count if available)
+- Error tracking (comprehensive error logging and alerting)
 
-#### 3. DJ Rule Extensions
-
-The rules engine can support:
-
-- **Time-of-Day Rules**: Different DJ behavior by hour
-- **Genre-Based Rules**: Match DJ segments to song genres
-- **Mood-Based Rules**: Match DJ segments to song mood
-- **Special Events**: Holiday-specific rules, event calendars
-- **External Triggers**: API endpoints for manual DJ segments
-
-#### 4. Playout Features
-
-- **Scheduled Events**: Play specific songs at specific times
-- **Live Interruptions**: Pause automation for live content
-- **Multiple Playlists**: Different playlists for different times
-- **Ad Insertion**: Commercial break support
-- **Emergency Alerts**: Weather alerts, EAS integration
-
-#### 5. Monitoring and Analytics
-
-- **Playback Metrics**: Track what's playing, when, for how long
-- **DJ Analytics**: Track DJ segment frequency and types
-- **Output Health**: Monitor sink status and quality
-- **Listener Analytics**: Track YouTube viewer count (if available)
-- **Error Tracking**: Comprehensive error logging and alerting
-
-### Performance Considerations
+### 10.3 Performance Considerations
 
 #### Current Bottlenecks (to address)
 
@@ -1047,70 +761,11 @@ The rules engine can support:
    - **Solution**: Already non-blocking (good)
    - **Enhancement**: Adaptive bitrate based on connection
 
-#### Scalability Targets
-
-- **Song Library**: Support 10,000+ songs
-- **DJ Files**: Support 1,000+ DJ segments
-- **Concurrent Outputs**: Support 5+ simultaneous sinks
-- **Latency**: <100ms from event queue to audio output
-- **CPU Usage**: <20% on Raspberry Pi 4
-
-### Migration Path
-
-#### Phase 1: Core Refactoring
-- Extract music_logic from MusicPlayer
-- Create broadcast_core with PlayoutEngine
-- Implement mixer layer
-
-#### Phase 2: DJ Separation
-- Rewrite DJManager as DJEngine
-- Implement rules engine and cadence manager
-- Integrate with PlayoutEngine
-
-#### Phase 3: Output Refactoring
-- Extract FMSink and YouTubeSink
-- Implement sink base class
-- Test dual-output reliability
-
-#### Phase 4: Enhancement
-- Add advanced audio processing
-- Implement monitoring and analytics
-- Add extensibility features
-
 ---
 
-## Summary
+## 11. Developer Implementation Requirements
 
-The rearchitected Radio Broadcast System separates concerns into six independent layers:
-
-1. **music_logic/**: Pure selection algorithms, no playback knowledge
-2. **dj_logic/**: Independent DJ decision-making system
-3. **broadcast_core/**: Non-blocking playout scheduling
-4. **mixer/**: Audio processing and format conversion
-5. **outputs/**: Independent audio sinks (FM primary, YouTube secondary)
-6. **/app/radio.py**: Thin orchestration shell
-
-**Key Benefits:**
-- Clear separation of concerns
-- Non-blocking architecture
-- Resilient dual-output (FM always works)
-- Extensible for future features
-- Testable components
-- Maintainable codebase
-
-**Next Steps:**
-1. Review and approve this architecture
-2. Begin implementation with music_logic/ extraction
-3. Iterate on design as implementation reveals issues
-4. Maintain backward compatibility during migration
-
----
-
----
-
-## Implementation Notes for Developers
-
-### Critical Implementation Requirements
+### 11.1 Critical Implementation Requirements
 
 1. **AudioDecoder MUST use FFmpeg with exact command specified**
    - No fallback to pydub or other libraries
@@ -1126,23 +781,86 @@ The rearchitected Radio Broadcast System separates concerns into six independent
    - `queue_event(event: AudioEvent)` - no variations
    - `run()` - main non-blocking loop
    - `current_state() -> PlaybackState` - state query only
+   - `is_idle() -> bool` - idle check
 
 4. **AudioEvent MUST be exactly as specified**
    - Dataclass with `path`, `type`, `gain` fields
-   - `type` must be Literal["song", "intro", "outro", "talk"]
+   - `type` must be `Literal["song", "intro", "outro", "talk"]`
    - No additional required fields (extensions optional)
 
-### Testing Requirements
+5. **SinkBase MUST implement exact interface specified**
+   - `write_frame(pcm_frame: bytes) -> None`
+   - `start() -> bool`
+   - `stop() -> None`
 
-- AudioDecoder: Test FFmpeg subprocess spawning and frame streaming
-- AudioMixer: Test frame-by-frame processing (not full-file)
-- PlayoutEngine: Test interface compliance (exact method signatures)
-- Sinks: Test frame-based writes (not buffer accumulation)
+### 11.2 Testing Requirements
+
+- **AudioDecoder**: Test FFmpeg subprocess spawning and frame streaming
+- **AudioMixer**: Test frame-by-frame processing (not full-file)
+- **PlayoutEngine**: Test interface compliance (exact method signatures)
+- **Sinks**: Test frame-based writes (not buffer accumulation)
+- **DJ Engine**: Test non-blocking decision logic
+- **State Machine**: Test valid state transitions
+
+### 11.3 Implementation Checklist
+
+#### Phase 1: Core Refactoring ✅
+- [x] Extract music_logic from MusicPlayer
+- [x] Create broadcast_core with PlayoutEngine
+- [x] Implement mixer layer
+- [x] Implement frame-based audio processing
+
+#### Phase 2: DJ Separation ✅
+- [x] Rewrite DJManager as DJEngine
+- [x] Implement rules engine and cadence manager
+- [x] Integrate with PlayoutEngine
+
+#### Phase 3: Output Refactoring ✅
+- [x] Extract FMSink and YouTubeSink
+- [x] Implement sink base class
+- [x] Test dual-output reliability
+
+#### Phase 4: Enhancement
+- [ ] Add advanced audio processing
+- [ ] Implement monitoring and analytics
+- [ ] Add extensibility features
+- [ ] Performance optimization
+
+#### Phase 5: Graceful Restart & State Persistence ✅
+- [x] Implement graceful restart (SIGUSR1)
+- [x] Add playlist state persistence
+- [x] Fix PID file path for systemd
+- [x] Suppress buffer underrun warnings during shutdown
 
 ---
 
-*Document Version: 1.1*  
-*Last Updated: [Current Date]*  
-*Author: System Architect (ChatGPT) & Implementation Developer (Cursor)*  
-*Refinements: Locked-in FFmpeg decoder, frame-based architecture, explicit interfaces*
+## Summary
 
+The Appalachia Radio system separates concerns into six independent layers:
+
+1. **music_logic/**: Pure selection algorithms, no playback knowledge
+2. **dj_logic/**: Independent DJ decision-making system
+3. **broadcast_core/**: Non-blocking playout scheduling
+4. **mixer/**: Audio processing and format conversion
+5. **outputs/**: Independent audio sinks (FM primary, YouTube secondary)
+6. **app/radio.py**: Thin orchestration shell
+
+**Key Benefits:**
+- Clear separation of concerns
+- Non-blocking architecture
+- Resilient dual-output (FM always works)
+- Extensible for future features
+- Testable components
+- Maintainable codebase
+
+**Locked-In Decisions:**
+- FFmpeg pipe decoder (exact command specified)
+- Frame-based architecture (no full-file loading)
+- Explicit interfaces (PlayoutEngine, AudioEvent, SinkBase)
+- FM primary, YouTube secondary (failure model)
+
+---
+
+*Document Version: 2.0 (Refactored)*  
+*Last Updated: 2025-12-01*  
+*Author: System Architect & Implementation Developer*
