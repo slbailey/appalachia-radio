@@ -2,11 +2,12 @@
 Playout engine for managing audio event playback.
 
 This module provides the PlayoutEngine class, which manages the queue of audio events
-and coordinates with the mixer for frame-by-frame audio delivery.
+and coordinates with the mixer for clock-driven, real-time frame delivery.
 """
 
 import logging
 import threading
+import queue
 from typing import Optional
 from broadcast_core.event_queue import AudioEvent, EventQueue
 from broadcast_core.state_machine import PlaybackState, StateMachine
@@ -18,9 +19,8 @@ class PlayoutEngine:
     """
     Non-blocking playout scheduler for audio events.
     
-    Manages queue of audio events (intro → song → outro) and coordinates
-    with mixer for frame-by-frame audio delivery. This is a scheduler, not
-    a player - it manages what should play when.
+    Manages queue of audio events and sets up decoders in the mixer.
+    Actual decoding happens one frame per clock tick in the mixer.
     """
     
     def __init__(self, mixer, stop_event: Optional[threading.Event] = None) -> None:
@@ -35,8 +35,10 @@ class PlayoutEngine:
         self.event_queue = EventQueue()
         self.state_machine = StateMachine()
         self._running = False
-        self._current_decoder = None
         self._stop_event = stop_event if stop_event is not None else threading.Event()
+        
+        # Set up event completion callback
+        self.mixer.set_event_complete_callback(self._on_event_complete)
     
     def queue_event(self, event: AudioEvent) -> None:
         """
@@ -62,20 +64,28 @@ class PlayoutEngine:
         Check if engine is idle (no events playing).
         
         Returns:
-            True if idle, False otherwise
+            True if idle (no events in queue and not currently playing), False otherwise
         """
-        return self.state_machine.get_state() == PlaybackState.IDLE
+        # Engine is idle if:
+        # 1. State machine is IDLE
+        # 2. Event queue is empty
+        # 3. Mixer is not playing anything (no active decoder AND no buffered frames)
+        is_state_idle = self.state_machine.get_state() == PlaybackState.IDLE
+        is_queue_empty = self.event_queue.empty()
+        is_mixer_idle = not self.mixer.is_playing() if self.mixer else True
+        
+        return is_state_idle and is_queue_empty and is_mixer_idle
     
     def run(self) -> None:
         """
-        Main blocking loop that processes events and ticks mixer.
+        Main loop that processes events from queue.
         
-        This method runs until stop_event is set. It processes events
-        from the queue and coordinates with the mixer for audio delivery.
+        This method sets up decoders for events. Actual decoding happens
+        one frame per clock tick in the mixer.
         """
         if not self._running:
             self._running = True
-            logger.info("PlayoutEngine started")
+            logger.info("PlayoutEngine started (clock-driven decoding)")
         
         # Main loop - runs until stop_event is set
         while self._running and not self._stop_event.is_set():
@@ -95,35 +105,33 @@ class PlayoutEngine:
                     self.state_machine.transition_to(PlaybackState.PLAYING_INTRO)  # Treat talk like intro
                 
                 self.state_machine.set_current_event(event)
+                
+                # Log "Now playing" when event starts
                 logger.info(f"[ENGINE] Now playing {event.path} ({event.type})")
                 
-                # Play the event through mixer
-                self._play_event(event)
+                # Start decoder for this event (decoding happens per clock tick)
+                if not self.mixer.start_event(event):
+                    logger.error(f"[ENGINE] Failed to start decoder for {event.path}")
+                    self.event_queue.task_done()
+                    # Transition to error state
+                    self.state_machine.transition_to(PlaybackState.ERROR)
+                    continue
                 
-                # Process frames until event is complete
-                # Keep calling tick() until the mixer finishes the event
-                while self.mixer.is_playing() and not self._stop_event.is_set():
-                    self.mixer.tick()
-                    # Small sleep to prevent busy-waiting
-                    import time
-                    time.sleep(0.001)  # 1ms sleep between frames
+                # Event is now being decoded by clock ticks
+                # Completion will be handled by _on_event_complete callback
                 
-                # Event completed
-                logger.info(f"[ENGINE] Completed {event.path}")
-                self.event_queue.task_done()
-                
-                # Update state to IDLE if no more events
-                if self.event_queue.empty():
-                    self.state_machine.transition_to(PlaybackState.IDLE)
-                    self.state_machine.set_current_event(None)
-                
-            except Exception:
-                # Queue empty or error - continue
+            except queue.Empty:
+                # Queue empty - check if we should transition to IDLE
+                if not self.mixer.is_playing():
+                    if self.state_machine.get_state() != PlaybackState.IDLE:
+                        self.state_machine.transition_to(PlaybackState.IDLE)
+                        self.state_machine.set_current_event(None)
                 pass
-            
-            # Note: Mixer tick is now called within the event processing loop
-            # to ensure events complete before moving to the next one
-            # This prevents "generator already executing" errors
+            except Exception as e:
+                # Log other errors for debugging
+                logger.error(f"Error processing event: {e}", exc_info=True)
+                import traceback
+                traceback.print_exc()
             
             # Small sleep to prevent busy-waiting when queue is empty
             import time
@@ -133,23 +141,27 @@ class PlayoutEngine:
         self._running = False
         logger.info("PlayoutEngine stopped")
     
-    def _play_event(self, event: AudioEvent) -> None:
+    def _on_event_complete(self, event: AudioEvent) -> None:
         """
-        Play an audio event through the mixer.
+        Callback when an event finishes (EOF from decoder).
+        
+        This is called by the mixer when decoder.next_frame() returns None.
         
         Args:
-            event: AudioEvent to play
+            event: Completed AudioEvent
         """
-        if not self.mixer:
-            logger.error("No mixer available")
-            return
+        logger.info(f"[ENGINE] Completed {event.path}")
+        self.event_queue.task_done()
         
-        try:
-            # Use mixer to decode and play the event
-            self.mixer.play_event(event)
-        except Exception as e:
-            logger.error(f"Error playing event {event.path}: {e}")
-            raise
+        # Update state to IDLE only if:
+        # 1. Queue is empty (no more events)
+        # 2. Mixer is idle (no active decoder AND no buffered frames)
+        if self.event_queue.empty() and not self.mixer.is_playing():
+            self.state_machine.transition_to(PlaybackState.IDLE)
+            self.state_machine.set_current_event(None)
+        else:
+            # Still playing (buffer has frames) - state will transition when buffer empties
+            logger.debug(f"[ENGINE] Event completed, but buffer still has {self.mixer.get_buffer_size()} frames")
     
     def stop(self) -> None:
         """
@@ -160,4 +172,3 @@ class PlayoutEngine:
         self._stop_event.set()
         self._running = False
         logger.info("PlayoutEngine stopped")
-

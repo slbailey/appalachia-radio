@@ -69,11 +69,10 @@ class Station:
         
         try:
             while self._running and not self.shutdown_event.is_set():
-                # Wait until playout is idle (Phase 7: poll every 250-500ms)
+                # Wait until playout is idle before queuing next song
+                # Poll every 250-500ms until engine is truly idle
                 while self._running and not self.shutdown_event.is_set() and not self.playout_engine.is_idle():
-                    # Poll playout engine to process events
-                    self.playout_engine.run()
-                    # Wait 250-500ms before checking again (Phase 7 spec)
+                    # Wait before checking again (Phase 7 spec: 250-500ms)
                     time.sleep(0.375)  # 375ms = middle of 250-500ms range
                 
                 if not self._running or self.shutdown_event.is_set():

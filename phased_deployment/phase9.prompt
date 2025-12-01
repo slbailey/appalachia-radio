@@ -1,0 +1,23 @@
+PHASE 9 — Implement MasterClock timing engine
+
+Goals:
+- Create MasterClock service as new module /clock/master_clock.py
+- Clock must emit ticks based on audio sample rate (48kHz)
+- Provide callback registration: on_tick(frame_index)
+- Mixer should SUBSCRIBE to MasterClock instead of pushing frames immediately
+- YouTubeSink and FMSink receive frames only when clock ticks
+- Add jitter smoothing (sleep drift correction)
+- Ensure no component free-runs outside clock control
+
+Clock Requirements:
+- Adjustable precision (default = 48000 ticks/sec)
+- Monotonic time base (time.monotonic_ns)
+- Drift correction every 500ms (compare expected vs actual time)
+- Optional faster timing for dev mode (simulate in real time)
+
+Expected Behavior:
+AudioDecoder feeds PCM → Mixer buffer
+MasterClock releases fixed-size PCM chunk each tick window
+Sinks pull equally spaced samples
+RTMP no longer buffers, no starve, no runaway
+FM output becomes rock-solid continuous stream

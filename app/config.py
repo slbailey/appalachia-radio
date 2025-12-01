@@ -73,13 +73,24 @@ def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> 
     # Helper to get bool value
     def get_bool(arg_name: str, env_name: str, default: bool) -> bool:
         """Get bool value from args or env."""
+        # For store_true actions, check if the flag was actually provided
+        # by checking if the value differs from default (or use a sentinel)
         if args and hasattr(args, arg_name):
             value = getattr(args, arg_name)
-            if value is not None:
-                return bool(value)
+            # For store_true, if value is True, the flag was provided
+            # If False, it might be default or explicitly False - check env first
+            if value is True:
+                return True
+            # If False, check env var (might be set to true in env)
+            # Only use False from args if env is not set
         env_val = os.getenv(env_name)
         if env_val:
             return env_val.lower() in ('true', '1', 'yes', 'on')
+        # If args had False and env is not set, use args value (or default)
+        if args and hasattr(args, arg_name):
+            value = getattr(args, arg_name)
+            if value is False:
+                return False
         return default
     
     # Helper to get int value

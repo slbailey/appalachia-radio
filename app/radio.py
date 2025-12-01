@@ -24,6 +24,7 @@ from broadcast_core.event_queue import AudioEvent
 from app.station import Station
 from app.config import RadioConfig, load_config_from_env_and_args
 from app.now_playing import NowPlayingWriter
+from clock.master_clock import MasterClock
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ def build_engine(
     video_size: str = "1280x720",
     video_fps: int = 2,
     video_bitrate: str = "4000k"
-) -> tuple[AudioMixer, PlayoutEngine, DJEngine]:
+) -> tuple[AudioMixer, PlayoutEngine, DJEngine, MasterClock]:
     """
     Build and wire up the audio engine components.
     
@@ -60,13 +61,27 @@ def build_engine(
         video_bitrate: Video bitrate (e.g., "4000k")
     
     Returns:
-        Tuple of (mixer, playout_engine, dj_engine)
+        Tuple of (mixer, playout_engine, dj_engine, master_clock)
     """
-    # Create mixer
-    mixer = AudioMixer()
+    # Phase 9: Create MasterClock first
+    sample_rate = 48000
+    frame_size = 4096
+    master_clock = MasterClock(
+        sample_rate=sample_rate,
+        frame_size=frame_size,
+        dev_mode=False
+    )
+    
+    # Create mixer with MasterClock
+    mixer = AudioMixer(
+        sample_rate=sample_rate,
+        channels=2,
+        frame_size=frame_size,
+        master_clock=master_clock
+    )
     
     # Create FM sink (always active)
-    fm_sink = FMSink(device=fm_device)
+    fm_sink = FMSink(device=fm_device, sample_rate=sample_rate, channels=2, frame_size=frame_size)
     mixer.add_sink(fm_sink)
     
     # Create YouTube sink (optional)
@@ -78,6 +93,10 @@ def build_engine(
         if youtube_rtmp_url:
             youtube_sink = YouTubeSink(
                 rtmp_url=youtube_rtmp_url,
+                master_clock=master_clock,  # Pass MasterClock for clock-driven operation
+                sample_rate=sample_rate,
+                channels=2,
+                frame_size=frame_size,
                 video_source=video_source,
                 video_file=video_file,
                 video_size=video_size,
@@ -92,7 +111,7 @@ def build_engine(
     # Create DJ engine (music_path parameter kept for compatibility but not used)
     dj_engine = DJEngine(dj_path, regular_music_path)
     
-    return mixer, playout_engine, dj_engine
+    return mixer, playout_engine, dj_engine, master_clock
 
 
 def build_events_for_song(
@@ -174,8 +193,8 @@ def start_station(config: RadioConfig) -> None:
     if config.enable_youtube and not rtmp_url and config.youtube_stream_key:
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{config.youtube_stream_key}"
     
-    # Build engine (now returns dj_engine)
-    mixer, playout_engine, dj_engine = build_engine(
+    # Build engine (now returns master_clock)
+    mixer, playout_engine, dj_engine, master_clock = build_engine(
         regular_music_path=str(config.regular_music_path),
         holiday_music_path=str(config.holiday_music_path),
         dj_path=str(config.dj_path),
@@ -199,10 +218,15 @@ def start_station(config: RadioConfig) -> None:
     # Create now-playing writer (Phase 8)
     now_playing_writer = NowPlayingWriter(config.now_playing_path)
     
+    # Phase 9: Start MasterClock first (must be running before sinks)
+    master_clock.start()
+    logger.info("MasterClock started")
+    
     # Start sinks
     if mixer.fm_sink:
         if not mixer.fm_sink.start():
             logger.error("Failed to start FM sink")
+            master_clock.stop()
             return
     
     for sink in mixer.sinks:
@@ -240,10 +264,13 @@ def start_station(config: RadioConfig) -> None:
         # Run station in main thread
         station.run()
     finally:
-        # Cleanup (Phase 8)
+        # Cleanup (Phase 8 + Phase 9)
         logger.info("Shutting down...")
         shutdown_event.set()
         playout_engine.stop()
+        
+        # Phase 9: Stop MasterClock first (stops frame delivery)
+        master_clock.stop()
         
         # Stop all sinks
         for sink in mixer.sinks:
