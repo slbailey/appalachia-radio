@@ -109,7 +109,8 @@ class DJEngine:
         music_path: str,
         library_manager=None,
         playlist_manager=None,
-        playlog=None
+        playlog=None,
+        cadence_min_songs: int = 3
     ) -> None:
         """
         Initialize the DJ engine.
@@ -120,6 +121,7 @@ class DJEngine:
             library_manager: LibraryManager instance (for getting available tracks)
             playlist_manager: PlaylistManager instance (for selecting next song)
             playlog: Playlog instance (for history context)
+            cadence_min_songs: Minimum songs between DJ segments (default: 3, valid: 2-4)
         """
         self.dj_path = dj_path
         self.music_path = music_path
@@ -127,8 +129,8 @@ class DJEngine:
         self.playlist_manager = playlist_manager
         self.playlog = playlog
         
-        # Initialize components
-        self.cadence_manager = CadenceManager()
+        # Initialize components with configurable cadence
+        self.cadence_manager = CadenceManager(min_songs_between_segments=cadence_min_songs)
         self.rules_engine = RulesEngine(self.cadence_manager)
         self.track_matcher = TrackMatcher(dj_path)
         
@@ -195,9 +197,10 @@ class DJEngine:
         else:
             # Cadence blocked - log it
             songs_since = self.cadence_manager.get_songs_since_last_segment()
+            min_songs = self.cadence_manager.get_min_songs()
             logger.debug(
                 f"[DJ] Cadence blocked segment for '{os.path.basename(song_path)}' "
-                f"(only {songs_since} songs since last segment, need 3+)"
+                f"(only {songs_since} songs since last segment, need {min_songs}+)"
             )
         
         # 2) Always play the song
@@ -408,7 +411,7 @@ class DJEngine:
         next_filename = os.path.basename(next_track)
         
         # Decision logic: decide for the song being preloaded
-        # Prefer intro, fallback to outro, at most one segment per song
+        # Both intro and outro can play (no mutual exclusion)
         played_segment = False
         
         # Check cadence
@@ -417,7 +420,7 @@ class DJEngine:
             p_intro = self.rules_engine.intro_probability()
             p_outro = self.rules_engine.outro_probability()
             
-            # 1) Try intro first (if allowed by cadence + probability)
+            # 1) Try intro (if allowed by cadence + probability)
             next_intro_path = self.track_matcher.find_intro(next_track)
             if next_intro_path:
                 roll = random.random()
@@ -427,25 +430,28 @@ class DJEngine:
                     played_segment = True
                     logger.info(f"[DJ] Speaking: INTRO {os.path.basename(next_intro_path)}")
             
-            # 2) If no intro, try outro
-            if not played_segment:
-                next_outro_path = self.track_matcher.find_outro(next_track)
-                if next_outro_path:
-                    roll = random.random()
-                    if roll < p_outro:
-                        events.append(AudioEvent(path=next_outro_path, type="outro", gain=1.0))
+            # 2) Try outro (can play even if intro was played)
+            next_outro_path = self.track_matcher.find_outro(next_track)
+            if next_outro_path:
+                roll = random.random()
+                if roll < p_outro:
+                    events.append(AudioEvent(path=next_outro_path, type="outro", gain=1.0))
+                    # Only register segment played once (don't double-count if both play)
+                    if not played_segment:
                         self.cadence_manager.register_segment_played()
-                        played_segment = True
-                        logger.info(f"[DJ] Speaking: OUTRO {os.path.basename(next_outro_path)}")
+                    played_segment = True
+                    logger.info(f"[DJ] Speaking: OUTRO {os.path.basename(next_outro_path)}")
             
             # Log if no segment
             if not played_segment:
                 songs_since = self.cadence_manager.get_songs_since_last_segment()
-                logger.info(f"[DJ] Silent (cadence {songs_since}/3)")
+                min_songs = self.cadence_manager.get_min_songs()
+                logger.info(f"[DJ] Silent (cadence {songs_since}/{min_songs})")
         else:
             # Cadence blocked
             songs_since = self.cadence_manager.get_songs_since_last_segment()
-            logger.info(f"[DJ] Silent (cadence {songs_since}/3)")
+            min_songs = self.cadence_manager.get_min_songs()
+            logger.info(f"[DJ] Silent (cadence {songs_since}/{min_songs})")
         
         # Always add the song itself
         events.append(AudioEvent(path=next_track, type="song", gain=1.0))

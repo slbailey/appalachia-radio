@@ -115,3 +115,12 @@ class CadenceManager:
         """
         with self._lock:
             return self._songs_since_last_segment
+    
+    def get_min_songs(self) -> int:
+        """
+        Get the minimum songs required between segments.
+        
+        Returns:
+            Minimum songs between segments
+        """
+        return self._min_songs

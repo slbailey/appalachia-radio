@@ -6,9 +6,12 @@ YouTube Live via RTMP using FFmpeg. Uses internal worker thread for pacing.
 """
 
 import logging
+import math
+import random
 import subprocess
 import threading
 import time
+from array import array
 from collections import deque
 from typing import Optional
 from outputs.sink_base import SinkBase
@@ -89,6 +92,115 @@ class YouTubeSink(SinkBase):
         
         # Periodic logging
         self._last_log_time = time.time()
+        
+        # --- Lightweight DSP for YouTube fingerprint hardening ---
+        # Soft saturation strength (0.0 - 0.05 is reasonable)
+        self._sat_strength = 0.02
+        
+        # Tiny EQ tilt amount (high-ish shelf flavor)
+        self._eq_alpha = 0.05  # 0 = off, 0.05 = subtle
+        
+        # Stereo width factor (1.0 = unchanged, 1.05 = +5% wider)
+        self._stereo_width = 1.05
+        
+        # Low-level noise gain (in dB, e.g. -55 dB ~ almost inaudible)
+        self._noise_db = -55.0
+        self._noise_gain = 10 ** (self._noise_db / 20.0)
+        
+        # Per-channel EQ state
+        self._prev_L = 0.0
+        self._prev_R = 0.0
+        
+        # Noise buffer: 1 second of stereo noise at sample_rate
+        self._noise_L, self._noise_R = self._make_noise_buffer(self.sample_rate)
+        self._noise_idx = 0
+    
+    def _make_noise_buffer(self, length: int) -> tuple[list[float], list[float]]:
+        """Pre-generate a short stereo noise buffer for low-level noise bed."""
+        bufL = [random.uniform(-1.0, 1.0) for _ in range(length)]
+        bufR = [random.uniform(-1.0, 1.0) for _ in range(length)]
+        return bufL, bufR
+    
+    def _process_frame_for_youtube(self, pcm_frame: bytes) -> bytes:
+        """
+        Apply very lightweight DSP to a PCM frame before sending to YouTube.
+
+        - int16 stereo s16le → float [-1,1] → DSP → int16
+        - Operations:
+          * soft saturation
+          * tiny EQ tilt
+          * slight stereo width tweak
+          * low-level noise bed
+        """
+        # Fast path: if gain is effectively zero or we're disconnected, just return
+        if not pcm_frame:
+            return pcm_frame
+
+        # Interpret bytes as int16 samples (L, R, L, R, ...)
+        samples = array("h")
+        samples.frombytes(pcm_frame)
+
+        # Sanity: must be stereo
+        if self.channels != 2:
+            # If not stereo, don't risk messing it up
+            return pcm_frame
+
+        # Iterate over stereo frames
+        for i in range(0, len(samples), 2):
+            # --- Load & normalize ---
+            L = samples[i] / 32768.0
+            R = samples[i + 1] / 32768.0
+
+            # --- 1) Soft saturation (very mild) ---
+            # y = x - s * x^3
+            s = self._sat_strength
+            L = L - s * (L * L * L)
+            R = R - s * (R * R * R)
+
+            # Clamp to [-1, 1]
+            L = max(-1.0, min(1.0, L))
+            R = max(-1.0, min(1.0, R))
+
+            # --- 2) Tiny EQ tilt (simple one-pole high-ish shelf) ---
+            # y = x + alpha * (x - prev)
+            alpha = self._eq_alpha
+            dL = L - self._prev_L
+            dR = R - self._prev_R
+
+            L = L + alpha * dL
+            R = R + alpha * dR
+
+            self._prev_L = L
+            self._prev_R = R
+
+            # --- 3) Stereo width tweak via mid/side ---
+            M = 0.5 * (L + R)
+            S = 0.5 * (L - R)
+
+            S *= self._stereo_width
+
+            L = M + S
+            R = M - S
+
+            # --- 4) Low-level noise bed ---
+            nL = self._noise_L[self._noise_idx]
+            nR = self._noise_R[self._noise_idx]
+
+            L += self._noise_gain * nL
+            R += self._noise_gain * nR
+
+            self._noise_idx += 1
+            if self._noise_idx >= len(self._noise_L):
+                self._noise_idx = 0
+
+            # Final clamp and convert back to int16
+            L = max(-1.0, min(1.0, L))
+            R = max(-1.0, min(1.0, R))
+
+            samples[i] = int(round(L * 32767.0))
+            samples[i + 1] = int(round(R * 32767.0))
+
+        return samples.tobytes()
     
     def start(self) -> bool:
         """
@@ -200,7 +312,14 @@ class YouTubeSink(SinkBase):
                         frame = self._queue.popleft()
                     else:
                         frame = bytes(self.frame_size)  # silence
-                
+
+                # Apply lightweight DSP only for YouTube before sending to FFmpeg
+                try:
+                    frame = self._process_frame_for_youtube(frame)
+                except Exception as dsp_err:
+                    # Fail-safe: if DSP ever blows up, log and fall back to raw
+                    logger.warning(f"[YouTubeSink] DSP error, sending raw frame: {dsp_err}")
+
                 # Write frame to FFmpeg
                 try:
                     with self._process_lock:
@@ -384,32 +503,32 @@ class YouTubeSink(SinkBase):
                 # Calculate GOP for <= 4 second keyframe interval (YouTube requirement)
                 max_keyframe_seconds = 4
                 gop_size = self.video_fps * max_keyframe_seconds
-            
-            # Calculate buffer size
-            try:
-                bitrate_str = self.video_bitrate.rstrip('kKmM')
-                bitrate_num = int(bitrate_str)
-                bitrate_unit = self.video_bitrate[-1].lower() if self.video_bitrate[-1] in 'kKmM' else 'k'
-                buffer_num = bitrate_num * 2
-                buffer_size = f"{buffer_num}{bitrate_unit}"
-            except (ValueError, IndexError):
-                buffer_size = "8000k"
-            
-            cmd.extend([
-                "-c:a", "aac",
+                
+                # Calculate buffer size
+                try:
+                    bitrate_str = self.video_bitrate.rstrip('kKmM')
+                    bitrate_num = int(bitrate_str)
+                    bitrate_unit = self.video_bitrate[-1].lower() if self.video_bitrate[-1] in 'kKmM' else 'k'
+                    buffer_num = bitrate_num * 2
+                    buffer_size = f"{buffer_num}{bitrate_unit}"
+                except (ValueError, IndexError):
+                    buffer_size = "8000k"
+                
+                cmd.extend([
+                    "-c:a", "aac",
                     "-b:a", "160k",
-                "-c:v", "libx264",
+                    "-c:v", "libx264",
                     "-preset", "ultrafast",
-                "-pix_fmt", "yuv420p",
-                "-b:v", self.video_bitrate,
-                "-maxrate", self.video_bitrate,
-                "-bufsize", buffer_size,
-                "-g", str(gop_size),
-                "-keyint_min", str(self.video_fps),
-                "-sc_threshold", "0",
+                    "-pix_fmt", "yuv420p",
+                    "-b:v", self.video_bitrate,
+                    "-maxrate", self.video_bitrate,
+                    "-bufsize", buffer_size,
+                    "-g", str(gop_size),
+                    "-keyint_min", str(self.video_fps),
+                    "-sc_threshold", "0",
                     "-fflags", "nobuffer",
                     "-flags", "low_delay",
-            ])
+                ])
             
             if self.video_source == "image":
                 cmd.extend(["-vf", f"scale={self.video_size}"])

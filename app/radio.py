@@ -180,7 +180,8 @@ def start_station(config: RadioConfig) -> None:
         music_path=str(config.regular_music_path),
         library_manager=library_manager,
         playlist_manager=playlist_manager,
-        playlog=playout_engine.playlog
+        playlog=playout_engine.playlog,
+        cadence_min_songs=config.dj_cadence_min_songs
     )
     
     # Create shutdown event (Phase 8)

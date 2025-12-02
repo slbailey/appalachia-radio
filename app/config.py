@@ -40,6 +40,7 @@ class RadioConfig:
     debug: bool  # Enable verbose debug logging (periodic stats, frame-by-frame logs, etc.)
     now_playing_path: Path  # File to write current track metadata to
     playlist_state_path: Path  # File to save/load playlist state (history and play counts)
+    dj_cadence_min_songs: int  # Minimum songs between DJ segments (2-4)
 
 
 def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> RadioConfig:
@@ -140,6 +141,10 @@ def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> 
         get_value("playlist_state_path", "PLAYLIST_STATE_PATH", "/tmp/playlist_state.json")
     )
     
+    # DJ cadence: min 2, max 4, default 3
+    cadence_raw = get_int("dj_cadence_min_songs", "DJ_CADENCE_MIN_SONGS", 3)
+    dj_cadence_min_songs = max(2, min(4, cadence_raw))  # Clamp to valid range
+    
     return RadioConfig(
         regular_music_path=regular_music_path,
         holiday_music_path=holiday_music_path,
@@ -157,6 +162,7 @@ def load_config_from_env_and_args(args: Optional[argparse.Namespace] = None) -> 
         log_level=log_level,
         debug=debug,
         now_playing_path=now_playing_path,
-        playlist_state_path=playlist_state_path
+        playlist_state_path=playlist_state_path,
+        dj_cadence_min_songs=dj_cadence_min_songs
     )
 
