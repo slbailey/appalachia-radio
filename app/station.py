@@ -13,7 +13,7 @@ import threading
 from typing import Optional
 from music_logic.library_manager import LibraryManager
 from music_logic.playlist_manager import PlaylistManager
-from dj_logic.dj_engine import DJEngine, DJSegment
+from dj_logic.dj_engine import DJEngine
 from broadcast_core.playout_engine import PlayoutEngine
 from broadcast_core.event_queue import AudioEvent
 from app.now_playing import NowPlaying, NowPlayingWriter
@@ -61,22 +61,36 @@ class Station:
         self.debug = debug
         self._restart_requested = False
         self._current_song_filename = None
+        self._current_song_path = None  # Full path to currently playing song
         self._current_song_is_holiday = False
         self._current_song_finished = False  # Flag to track if current song finished during restart
         
+        # Wire DJEngine to PlayoutEngine for event-driven decisions
+        self.playout_engine.set_dj_engine(self.dj_engine)
+        
+        # DJ no longer uses queue_events_callback - decisions are returned directly
+        # DJ no longer receives song_finished callbacks - only song_started
+        
         # Register callback to update playlist history when songs complete
         self.playout_engine.add_event_complete_callback(self._on_song_complete)
+        
+        # Register metadata/history tracking callback
+        self.playout_engine.add_event_start_callback(self._on_song_start)
+    
     
     def run(self) -> None:
         """
         Run the main station loop.
         
-        Continuously selects songs, queues events, and processes playback.
-        Matches Phase 7 spec: wait until playout is idle, then select next song.
+        Pure event-driven model:
+        - Station startup event → DJ decision → preload deck A
+        - Song started event → DJ decision → preload opposite deck
+        - Song finished event → DJ records completion
+        - Loop only waits for shutdown/restart
         """
         self._running = True
         if self.debug:
-            logger.info("Station started")
+            logger.info("Station started (DJ-driven event model)")
         
         try:
             while self._running:
@@ -85,7 +99,7 @@ class Station:
                     # Normal shutdown - break immediately
                     break
                 
-                # Wait until playout is idle before queuing next song
+                # Wait until playout is idle before checking for restart
                 # For restart, continue waiting even if shutdown_event is set
                 # Poll every 250-500ms until engine is truly idle
                 while self._running and not self.playout_engine.is_idle():
@@ -112,60 +126,10 @@ class Station:
                 if not self._running or (self.shutdown_event.is_set() and not self._restart_requested):
                     break
                 
-                # Get all tracks from library (Phase 7 spec: library.get_all_tracks())
-                available_tracks = self.library_manager.get_all_tracks()
-                
-                if not available_tracks:
-                    logger.warning("No tracks available, waiting...")
-                    time.sleep(5.0)
-                    continue
-                
-                # Select next song (Phase 7 spec: playlist.select_next_song(available_tracks))
-                track = self.playlist_manager.select_next_song(available_tracks)
-                filename = os.path.basename(track)
-                
-                # Build events using Phase 6 helper pattern (Phase 7 spec: build_events_for_song)
-                # Import here to avoid circular import
-                from app.radio import build_events_for_song
-                events = build_events_for_song(
-                    song_file=filename,
-                    full_path=track,
-                    dj_engine=self.dj_engine,
-                    dj_path=self.dj_engine.dj_path
-                )
-                
-                # Determine intro/outro usage for now-playing metadata
-                intro_used = any(event.type == "intro" for event in events)
-                outro_used = any(event.type == "outro" for event in events)
-                
-                # Write now-playing metadata (Phase 8)
-                if self.now_playing_writer:
-                    now_playing = NowPlaying(
-                        title=filename,
-                        path=track,
-                        started_at=time.time(),
-                        intro_used=intro_used,
-                        outro_used=outro_used
-                    )
-                    try:
-                        self.now_playing_writer.write(now_playing)
-                    except Exception as e:
-                        logger.error(f"Failed to write now-playing metadata: {e}")
-                
-                # Log song start with DJ usage (only in debug mode, events are logged separately)
-                if self.debug:
-                    logger.info(f"Now playing: {filename} (intro={intro_used}, outro={outro_used})")
-                
-                # Queue all events (Phase 7 spec: for ev in events: playout.queue_event(ev))
-                for ev in events:
-                    self.playout_engine.queue_event(ev)
-                
-                # Store current song info for history update
-                self._current_song_filename = filename
-                self._current_song_is_holiday = 'holiday' in track.lower()
-                self._current_song_finished = False  # Reset flag when new song starts
-                
-                # Playout engine runs in its own thread, so events will be processed automatically
+                # If we get here, playout is idle and we're not shutting down
+                # This shouldn't normally happen in the event-driven model, but
+                # we keep the loop for restart/shutdown handling
+                time.sleep(0.5)  # Small sleep to prevent busy-waiting
                 
         except KeyboardInterrupt:
             if self.debug:
@@ -173,23 +137,44 @@ class Station:
         except Exception as e:
             logger.error(f"Station error: {e}", exc_info=True)
         finally:
-            self.stop()
-    
-    def stop(self) -> None:
-        """Stop the station."""
-        self._running = False
-        try:
+            self._running = False
+            
+            # Save playlist state
+            if hasattr(self, 'playlist_manager') and self.playlist_manager:
+                self.playlist_manager.save_state()
+            
             if self.debug:
-                logger.info("Stopping station...")
-        except (OSError, ValueError):
-            # Ignore logging errors during shutdown
-            pass
-        # Save playlist state on shutdown
-        if hasattr(self, 'playlist_manager') and self.playlist_manager:
-            self.playlist_manager.save_state()
+                logger.info("Station stopped")
+    
+    def _on_song_start(self, event: AudioEvent) -> None:
+        """
+        Callback when an event starts playing - handles metadata and history tracking.
         
-        if self.debug:
-            logger.info("Station stopped")
+        DJ decisions are handled by DJEngine callbacks (on_song_started).
+        
+        Args:
+            event: Started AudioEvent
+        """
+        # Only handle metadata for song events (not intro/outro)
+        if event.type == "song":
+            # Store current song path for history tracking
+            self._current_song_path = event.path
+            self._current_song_filename = os.path.basename(event.path)
+            self._current_song_is_holiday = 'holiday' in event.path.lower()
+            
+            # Write now-playing metadata
+            if self.now_playing_writer:
+                now_playing = NowPlaying(
+                    title=self._current_song_filename,
+                    path=event.path,
+                    started_at=time.time(),
+                    intro_used=False,  # TODO: Track this from DJ decision
+                    outro_used=False   # TODO: Track this from DJ decision
+                )
+                try:
+                    self.now_playing_writer.write(now_playing)
+                except Exception as e:
+                    logger.error(f"Failed to write now-playing metadata: {e}")
     
     def _on_song_complete(self, event: AudioEvent) -> None:
         """
@@ -210,4 +195,3 @@ class Station:
                 filename,
                 self._current_song_is_holiday
             )
-

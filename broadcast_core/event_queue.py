@@ -46,7 +46,7 @@ class EventQueue:
             event: AudioEvent to add
         """
         self._queue.put(event)
-        logger.info(f"[EVENT] Pushed: {event.type} - {event.path}")
+        logger.debug(f"[EVENT] Pushed: {event.type} - {event.path}")
     
     def get(self, block: bool = True, timeout: float | None = None) -> AudioEvent:
         """
@@ -63,7 +63,7 @@ class EventQueue:
             queue.Empty: If block=False and queue is empty
         """
         event = self._queue.get(block=block, timeout=timeout)
-        logger.info(f"[EVENT] Pulled: {event.type} - {event.path}")
+        logger.debug(f"[EVENT] Pulled: {event.type} - {event.path}")
         return event
     
     def empty(self) -> bool:

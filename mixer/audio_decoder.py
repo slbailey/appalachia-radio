@@ -59,7 +59,7 @@ class AudioDecoder:
             True if started successfully, False otherwise
         """
         if not os.path.exists(event.path):
-            logger.error(f"Audio file not found: {event.path}")
+            logger.error(f"[DECODER] File not found: {os.path.basename(event.path)}")
             return False
         
         # Close any existing process
@@ -77,8 +77,7 @@ class AudioDecoder:
         ]
         
         try:
-            if self.debug:
-                logger.info(f"[DECODER] Starting FFmpeg decoder for: {event.path}")
+            logger.debug(f"[DECODER] Starting: {os.path.basename(event.path)}")
             
             # Spawn FFmpeg process
             self._process = subprocess.Popen(
@@ -96,7 +95,7 @@ class AudioDecoder:
                     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
                     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
                 except Exception as e:
-                    logger.warning(f"Failed to set stdout non-blocking: {e}")
+                    logger.warning(f"[DECODER] Failed to set non-blocking: {e}")
             
             # Give FFmpeg a moment to initialize
             import time
@@ -107,18 +106,20 @@ class AudioDecoder:
                 stderr_output = self._process.stderr.read()
                 if stderr_output:
                     error_msg = stderr_output.decode('utf-8', errors='ignore')
-                    logger.error(f"[DECODER] FFmpeg failed to start: {error_msg}")
+                    logger.error(f"[DECODER] FFmpeg failed: {error_msg}")
+                else:
+                    logger.error(f"[DECODER] FFmpeg exited (code: {self._process.returncode})")
                 return False
             
             self._current_event = event
             self._first_frame = True
             self._frame_count = 0
             
-            logger.debug(f"[DECODER] Decoder started for: {event.path}")
+            logger.debug(f"[DECODER] Started: {os.path.basename(event.path)}")
             return True
             
         except Exception as e:
-            logger.error(f"[DECODER] Error starting decoder for {event.path}: {e}")
+            logger.error(f"[DECODER] Error starting: {os.path.basename(event.path)}: {e}")
             if self._process:
                 self._process.terminate()
                 self._process = None
@@ -140,13 +141,20 @@ class AudioDecoder:
         # Check if process died
         if self._process.poll() is not None:
             # Process finished - check for errors
+            # Store event path before close() clears it
+            event_path = self._current_event.path if self._current_event else "unknown"
+            frame_count = self._frame_count
+            
             stderr_output = self._process.stderr.read()
             if stderr_output:
                 error_msg = stderr_output.decode('utf-8', errors='ignore')
-                logger.error(f"[DECODER] FFmpeg stderr for {self._current_event.path}: {error_msg}")
+                logger.error(f"[DECODER] FFmpeg stderr: {error_msg}")
             
-            logger.info(f"[DECODER] EOF reached after {self._frame_count} frames: {self._current_event.path}")
-            self.close()
+            logger.debug(f"[DECODER] EOF: {os.path.basename(event_path)} ({frame_count} frames)")
+            # Don't close here - let mixer handle it so it can get the event first
+            # Just mark process as done
+            self._process = None
+            # Keep _current_event so mixer can retrieve it before closing
             return None
         
         # Use select with zero timeout for truly non-blocking read
@@ -170,16 +178,24 @@ class AudioDecoder:
         except OSError:
             # Process may have closed stdout
             if self._process.poll() is not None:
-                logger.info(f"[DECODER] EOF reached after {self._frame_count} frames: {self._current_event.path}")
-                self.close()
+                # Store event path before clearing
+                event_path = self._current_event.path if self._current_event else "unknown"
+                frame_count = self._frame_count
+                logger.debug(f"[DECODER] EOF: {os.path.basename(event_path)} ({frame_count} frames)")
+                # Don't close here - let mixer handle it so it can get the event first
+                self._process = None
                 return None
             return b''
         
         if not frame:
             # Empty read - check if process finished
             if self._process.poll() is not None:
-                logger.info(f"[DECODER] EOF reached after {self._frame_count} frames: {self._current_event.path}")
-                self.close()
+                # Store event path before clearing
+                event_path = self._current_event.path if self._current_event else "unknown"
+                frame_count = self._frame_count
+                logger.debug(f"[DECODER] EOF: {os.path.basename(event_path)} ({frame_count} frames)")
+                # Don't close here - let mixer handle it so it can get the event first
+                self._process = None
                 return None  # Actual EOF
             # Process still running but no data - return empty to try again
             return b''
@@ -201,19 +217,64 @@ class AudioDecoder:
         
         if self._first_frame:
             if self.debug:
-                logger.info(f"[DECODER] First frame received: {len(frame)} bytes from {self._current_event.path}")
+                logger.debug(f"[DECODER] First frame: {len(frame)} bytes")
             self._first_frame = False
         
         return frame
     
+    def set_event(self, event: AudioEvent) -> None:
+        """
+        Set the event for this decoder WITHOUT starting FFmpeg.
+        
+        This is used for preloading - the event is stored but FFmpeg
+        doesn't start until start() is called. This allows decision-making
+        and preparation (e.g., API calls for speech generation) to happen
+        while the active deck is playing, without starting audio decoding.
+        
+        FIX A: This method MUST store the event in a way that get_current_event()
+        returns it reliably, even when FFmpeg is NOT started. The event is stored
+        in _current_event, which is NOT cleared unless close() is explicitly called.
+        
+        Args:
+            event: AudioEvent to set
+        """
+        # Close any existing FFmpeg process (but preserve event if already set)
+        # Only close the process, don't clear the event yet
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=1.0)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+            self._process = None
+        
+        # Store the event - this is the source of truth for get_current_event()
+        # This MUST be set even if FFmpeg hasn't started
+        self._current_event = event
+        self._first_frame = True
+        self._frame_count = 0
+        logger.debug(f"[DECODER] Preloaded: {os.path.basename(event.path)}")
+    
     def is_active(self) -> bool:
         """
-        Check if decoder is actively decoding.
+        Check if decoder is actively decoding (FFmpeg process running).
         
         Returns:
             True if decoder has an active process, False otherwise
         """
         return self._process is not None and self._current_event is not None
+    
+    def has_event(self) -> bool:
+        """
+        Check if decoder has an event set (preloaded or active).
+        
+        Returns:
+            True if decoder has an event (even if not started), False otherwise
+        """
+        return self._current_event is not None
     
     def get_current_event(self) -> Optional[AudioEvent]:
         """

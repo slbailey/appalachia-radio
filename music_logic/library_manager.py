@@ -66,7 +66,7 @@ class LibraryManager:
             return mp3_files
         
         if not os.path.isdir(directory):
-            logger.warning(f"Path is not a directory: {directory}")
+            logger.warning(f"[LIBRARY] Path is not a directory: {directory}")
             return mp3_files
         
         try:
@@ -81,7 +81,7 @@ class LibraryManager:
             
             logger.debug(f"Scanned {directory}: found {len(mp3_files)} MP3 files")
         except OSError as e:
-            logger.error(f"Error scanning directory {directory}: {e}")
+            logger.error(f"[LIBRARY] Error scanning {directory}: {e}")
         
         return mp3_files
     
@@ -98,7 +98,7 @@ class LibraryManager:
         if not force and (current_time - self._last_refresh_time) < self.refresh_interval:
             return  # Cache still valid
         
-        logger.info("Refreshing music library...")
+        logger.debug("[LIBRARY] Refreshing...")
         
         # Scan both directories
         self._regular_tracks = self._scan_directory_recursive(self.regular_music_path)
@@ -106,7 +106,7 @@ class LibraryManager:
         
         self._last_refresh_time = current_time
         
-        logger.info(f"Library refreshed: {len(self._regular_tracks)} regular tracks, {len(self._holiday_tracks)} holiday tracks")
+        logger.debug(f"[LIBRARY] {len(self._regular_tracks)} regular, {len(self._holiday_tracks)} holiday")
     
     def get_all_tracks(self, include_holiday: bool = True) -> List[str]:
         """

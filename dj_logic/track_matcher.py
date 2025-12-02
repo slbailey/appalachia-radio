@@ -1,30 +1,29 @@
 """
 Track matcher for DJ file discovery.
 
-This module provides the TrackMatcher class, which matches DJ intro/outro
-files to songs based on naming conventions. Extracted from legacy DJManager.
+Phase 7: Finds intro/outro files for songs based on filename patterns.
 """
 
 import logging
 import os
+import random
 import time
-from typing import List
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Constants matching legacy implementation
+# Constants
 MAX_INTRO_FILES: int = 5
 MAX_OUTRO_FILES: int = 5
 
 
 class TrackMatcher:
     """
-    Matches DJ files to songs.
+    Matches DJ files to songs based on naming conventions.
     
-    Handles:
-    - Intro/outro file discovery with exact filename pattern matching
-    - Multiple variant support (intro1, intro2, etc.)
-    - File caching with TTL to avoid repeated directory scans
+    For a song "inkspots_wethree.mp3", looks for:
+    - Intros: inkspots_wethree_intro.mp3, inkspots_wethree_intro1.mp3, etc.
+    - Outros: inkspots_wethree_outro.mp3, inkspots_wethree_outro1.mp3, etc.
     """
     
     def __init__(self, dj_path: str, cache_ttl: float = 5.0) -> None:
@@ -77,94 +76,174 @@ class TrackMatcher:
                 self._available_files = set(os.listdir(self.dj_path))
                 self._cache_timestamp = current_time
                 self._cache_mtime = current_mtime
-                logger.debug(f"Refreshed DJ file list: {len(self._available_files)} files")
+                logger.debug(f"[TrackMatcher] Refreshed DJ file list: {len(self._available_files)} files")
             except OSError as e:
-                logger.error(f"Error reading DJ directory {self.dj_path}: {e}")
+                logger.error(f"[TrackMatcher] Error reading DJ directory {self.dj_path}: {e}")
                 return set()
         
         return self._available_files
     
-    def find_intro_files(self, song_path: str) -> List[str]:
+    def _find_variants(self, base: str, kind: str) -> List[str]:
         """
-        Find intro files matching a song.
-        
-        For song "MySong.mp3", looks for:
-        - MySong_intro1.mp3, MySong_intro2.mp3, ..., MySong_intro5.mp3
-        - MySong_intro.mp3
+        Find variant files for a base name and kind (intro/outro).
         
         Args:
-            song_path: Path to the song file (e.g., "/path/to/MySong.mp3")
+            base: Base filename without extension (e.g., "inkspots_wethree")
+            kind: Either "intro" or "outro"
+            
+        Returns:
+            List of full paths to matching files (numbered variants first, then base)
+        """
+        candidates: List[str] = []
+        available_files = self._get_available_files()
+        
+        if not available_files:
+            return candidates
+        
+        max_files = MAX_INTRO_FILES if kind == "intro" else MAX_OUTRO_FILES
+        
+        # 1) Check numbered variants (intro1, intro2, ..., intro5)
+        for i in range(1, max_files + 1):
+            name = f"{base}_{kind}{i}.mp3"
+            if name in available_files:
+                candidate = os.path.join(self.dj_path, name)
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+        
+        # 2) Check base name without number (intro.mp3, outro.mp3)
+        name = f"{base}_{kind}.mp3"
+        if name in available_files:
+            candidate = os.path.join(self.dj_path, name)
+            if os.path.isfile(candidate):
+                candidates.append(candidate)
+        
+        return candidates
+    
+    def find_intro(self, song_path: str) -> Optional[str]:
+        """
+        Find an intro file for a song.
+        
+        For song "inkspots_wethree.mp3", looks for:
+        - inkspots_wethree_intro1.mp3, inkspots_wethree_intro2.mp3, ...
+        - inkspots_wethree_intro.mp3
+        
+        Returns a random choice from available variants, or None if none found.
+        
+        Args:
+            song_path: Full path to the song file
+            
+        Returns:
+            Full path to an intro file, or None if none found
+        """
+        base = os.path.splitext(os.path.basename(song_path))[0]
+        variants = self._find_variants(base, "intro")
+        
+        if variants:
+            selected = random.choice(variants)
+            logger.debug(f"[TrackMatcher] Found intro: {os.path.basename(selected)} for {os.path.basename(song_path)}")
+            return selected
+        
+        return None
+    
+    def find_outro(self, song_path: str) -> Optional[str]:
+        """
+        Find an outro file for a song.
+        
+        For song "inkspots_wethree.mp3", looks for:
+        - inkspots_wethree_outro1.mp3, inkspots_wethree_outro2.mp3, ...
+        - inkspots_wethree_outro.mp3
+        
+        Returns a random choice from available variants, or None if none found.
+        
+        Args:
+            song_path: Full path to the song file
+            
+        Returns:
+            Full path to an outro file, or None if none found
+        """
+        base = os.path.splitext(os.path.basename(song_path))[0]
+        variants = self._find_variants(base, "outro")
+        
+        if variants:
+            selected = random.choice(variants)
+            logger.debug(f"[TrackMatcher] Found outro: {os.path.basename(selected)} for {os.path.basename(song_path)}")
+            return selected
+        
+        return None
+    
+    def find_intro(self, song_path: str) -> Optional[str]:
+        """
+        Find an intro file for a song (returns full path).
+        
+        Args:
+            song_path: Full path to the song file
+            
+        Returns:
+            Full path to an intro file, or None if none found
+        """
+        base = os.path.splitext(os.path.basename(song_path))[0]
+        variants = self._find_variants(base, "intro")
+        
+        if variants:
+            selected = random.choice(variants)
+            logger.debug(f"[TrackMatcher] Found intro: {os.path.basename(selected)} for {os.path.basename(song_path)}")
+            return selected
+        
+        return None
+    
+    def find_outro(self, song_path: str) -> Optional[str]:
+        """
+        Find an outro file for a song (returns full path).
+        
+        Args:
+            song_path: Full path to the song file
+            
+        Returns:
+            Full path to an outro file, or None if none found
+        """
+        base = os.path.splitext(os.path.basename(song_path))[0]
+        variants = self._find_variants(base, "outro")
+        
+        if variants:
+            selected = random.choice(variants)
+            logger.debug(f"[TrackMatcher] Found outro: {os.path.basename(selected)} for {os.path.basename(song_path)}")
+            return selected
+        
+        return None
+    
+    def find_intro_files(self, song_path: str) -> List[str]:
+        """
+        Legacy method: Find all intro files for a song.
+        
+        Returns list of filenames (not full paths) for backward compatibility.
+        
+        Args:
+            song_path: Path to the song file
             
         Returns:
             List of matching intro filenames (not full paths), empty if none found
         """
-        # Extract just the filename from path
-        song_filename = os.path.basename(song_path)
-        return self._check_dj_files(song_filename, 'intro')
+        base = os.path.splitext(os.path.basename(song_path))[0]
+        variants = self._find_variants(base, "intro")
+        # Return just filenames for backward compatibility
+        return [os.path.basename(v) for v in variants]
     
     def find_outro_files(self, song_path: str) -> List[str]:
         """
-        Find outro files matching a song.
+        Legacy method: Find all outro files for a song.
         
-        For song "MySong.mp3", looks for:
-        - MySong_outro1.mp3, MySong_outro2.mp3, ..., MySong_outro5.mp3
-        - MySong_outro.mp3
+        Returns list of filenames (not full paths) for backward compatibility.
         
         Args:
-            song_path: Path to the song file (e.g., "/path/to/MySong.mp3")
+            song_path: Path to the song file
             
         Returns:
             List of matching outro filenames (not full paths), empty if none found
         """
-        # Extract just the filename from path
-        song_filename = os.path.basename(song_path)
-        return self._check_dj_files(song_filename, 'outro')
-    
-    def _check_dj_files(self, mp3_file: str, file_type: str) -> List[str]:
-        """
-        Check for existing intro or outro files for a given MP3 file.
-        
-        This matches the legacy DJManager._check_dj_files logic exactly.
-        
-        Args:
-            mp3_file: Name of the MP3 file (e.g., "song.mp3")
-            file_type: Either 'intro' or 'outro'
-            
-        Returns:
-            List of filenames that exist in the DJ directory, in order:
-            - Base name first (e.g., "song_intro.mp3")
-            - Then numbered variants (e.g., "song_intro1.mp3", "song_intro2.mp3")
-        """
-        available_files = self._get_available_files()
-        if not available_files:
-            return []
-        
-        base_name = mp3_file.rsplit('.', 1)[0]  # Remove extension
-        max_files = MAX_INTRO_FILES if file_type == 'intro' else MAX_OUTRO_FILES
-        
-        # Generate possible file names
-        # Note: Legacy checks numbered variants first, then base
-        # But returns base first in the list
-        possible_files = [f"{base_name}_{file_type}{i}.mp3" for i in range(1, max_files + 1)]
-        possible_files.append(f"{base_name}_{file_type}.mp3")
-        
-        # Find files that actually exist
-        found_files = [f for f in possible_files if f in available_files]
-        
-        # Reorder to match legacy: base first, then numbered
-        # Legacy returns: base first, then numbered variants
-        base_file = f"{base_name}_{file_type}.mp3"
-        numbered_files = [f for f in found_files if f != base_file]
-        
-        result = []
-        if base_file in found_files:
-            result.append(base_file)
-        result.extend(sorted(numbered_files))  # Sort numbered variants
-        
-        if found_files:
-            logger.debug(f"Found {len(found_files)} {file_type} file(s) for {mp3_file}")
-        
-        return result
+        base = os.path.splitext(os.path.basename(song_path))[0]
+        variants = self._find_variants(base, "outro")
+        # Return just filenames for backward compatibility
+        return [os.path.basename(v) for v in variants]
     
     def invalidate_cache(self) -> None:
         """
@@ -172,4 +251,4 @@ class TrackMatcher:
         """
         self._cache_timestamp = 0.0
         self._cache_mtime = 0.0
-        logger.debug("DJ file cache invalidated")
+        logger.debug("[TrackMatcher] Cache invalidated")

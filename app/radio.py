@@ -110,59 +110,11 @@ def build_engine(
     # Create playout engine
     playout_engine = PlayoutEngine(mixer, debug=debug)
     
-    # Create DJ engine (music_path parameter kept for compatibility but not used)
-    dj_engine = DJEngine(dj_path, regular_music_path)
+    # DJ engine will be created later with full dependencies (library_manager, playlist_manager, playlog)
+    # Return None for now - will be set in start_station
+    dj_engine = None
     
     return mixer, playout_engine, dj_engine, master_clock
-
-
-def build_events_for_song(
-    song_file: str,
-    full_path: str,
-    dj_engine: DJEngine,
-    dj_path: str
-) -> list[AudioEvent]:
-    """
-    Build a list of AudioEvents for a song, including optional intro/outro.
-    
-    Returns: [ intro? ] → AudioEvent(song) → [ outro? ]
-    Never returns both intro and outro together.
-    
-    Args:
-        song_file: Song filename (e.g., "MySong.mp3")
-        full_path: Full path to the song file
-        dj_engine: DJEngine instance
-        dj_path: Path to DJ files directory
-        
-    Returns:
-        List of AudioEvent objects in play order
-    """
-    import os
-    
-    events: list[AudioEvent] = []
-    
-    # Get DJ segments for this song
-    segments = dj_engine.get_segments_for_song(full_path)
-    
-    # Add intro if present
-    for segment in segments:
-        if segment.segment_type == "intro":
-            intro_path = os.path.join(dj_path, segment.file_name)
-            events.append(AudioEvent(path=intro_path, type="intro", gain=1.0))
-            break  # Only one intro
-    
-    # Add the song itself
-    events.append(AudioEvent(path=full_path, type="song", gain=1.0))
-    
-    # Add outro if present (only if no intro was added)
-    if not any(e.type == "intro" for e in events):
-        for segment in segments:
-            if segment.segment_type == "outro":
-                outro_path = os.path.join(dj_path, segment.file_name)
-                events.append(AudioEvent(path=outro_path, type="outro", gain=1.0))
-                break  # Only one outro
-    
-    return events
 
 
 def start_station(config: RadioConfig) -> None:
@@ -186,13 +138,9 @@ def start_station(config: RadioConfig) -> None:
     # Ensure logs directory exists
     os.makedirs("logs", exist_ok=True)
     
-    # Log startup parameters (Phase 8)
-    logger.info("Starting Appalachia Radio Station")
-    logger.info(f"Music root (regular): {config.regular_music_path}")
-    logger.info(f"Music root (holiday): {config.holiday_music_path}")
-    logger.info(f"DJ path: {config.dj_path}")
-    logger.info(f"FM device: {config.fm_device}")
-    logger.info(f"YouTube enabled: {config.enable_youtube}")
+    # Log startup parameters
+    youtube_status = "on" if config.enable_youtube else "off"
+    logger.info(f"[STATION] Startup (FM {config.fm_device}, YouTube: {youtube_status})")
     
     # Initialize components
     library_manager = LibraryManager(
@@ -209,7 +157,7 @@ def start_station(config: RadioConfig) -> None:
         rtmp_url = f"rtmp://a.rtmp.youtube.com/live2/{config.youtube_stream_key}"
     
     # Build engine (now returns master_clock)
-    mixer, playout_engine, dj_engine, master_clock = build_engine(
+    mixer, playout_engine, _, master_clock = build_engine(
         regular_music_path=str(config.regular_music_path),
         holiday_music_path=str(config.holiday_music_path),
         dj_path=str(config.dj_path),
@@ -225,6 +173,16 @@ def start_station(config: RadioConfig) -> None:
         debug=config.debug
     )
     
+    # Create DJ engine with full dependencies
+    from dj_logic.dj_engine import DJEngine
+    dj_engine = DJEngine(
+        dj_path=str(config.dj_path),
+        music_path=str(config.regular_music_path),
+        library_manager=library_manager,
+        playlist_manager=playlist_manager,
+        playlog=playout_engine.playlog
+    )
+    
     # Create shutdown event (Phase 8)
     shutdown_event = threading.Event()
     
@@ -236,13 +194,12 @@ def start_station(config: RadioConfig) -> None:
     
     # Phase 9: Start MasterClock first (must be running before sinks)
     master_clock.start()
-    if config.debug:
-        logger.info("MasterClock started")
+    logger.debug("[STATION] MasterClock started")
     
     # Start sinks
     if mixer.fm_sink:
         if not mixer.fm_sink.start():
-            logger.error("Failed to start FM sink")
+            logger.error("[STATION] Failed to start FM sink")
             master_clock.stop()
             return
     
@@ -250,10 +207,9 @@ def start_station(config: RadioConfig) -> None:
         if sink is not mixer.fm_sink:
             try:
                 sink.start()
-                if isinstance(sink, YouTubeSink) and config.debug:
-                    logger.info("YouTube sink started")
+                logger.debug(f"[STATION] {type(sink).__name__} started")
             except Exception as e:
-                logger.warning(f"Failed to start sink {type(sink).__name__}: {e}")
+                logger.warning(f"[STATION] Failed to start {type(sink).__name__}: {e}")
     
     # Create and start station
     station = Station(
@@ -266,15 +222,33 @@ def start_station(config: RadioConfig) -> None:
         now_playing_writer=now_playing_writer
     )
     
-    # Handle SIGUSR1 for graceful restart (wait for current song to finish)
-    # Must be defined after station is created
+    # Phase 4: Handle SIGUSR1 for graceful restart (wait for current event to finish)
+    # Must be defined after playout_engine is created
     def restart_handler(sig, frame):
-        logger.info("Restart requested - will restart after current song finishes")
-        station._restart_requested = True
-        # Also set shutdown to stop accepting new songs
+        logger.info("[STATION] Restart signal received")
+        playout_engine.request_restart()
+        # Also set shutdown to stop accepting new events
         shutdown_event.set()
     
     signal.signal(signal.SIGUSR1, restart_handler)
+    
+    # Phase 6: Start HTTP status server in background thread
+    from app import dashboard
+    dashboard_server = None
+    dashboard_thread = None
+    try:
+        dashboard_server = dashboard.make_server(
+            host="0.0.0.0",
+            port=8080,
+            get_health=playout_engine.health,
+            get_now_playing=playout_engine.now_playing,
+            get_next_up=playout_engine.next_up,
+            get_recent_playlog=lambda limit: playout_engine.playlog.recent(limit),
+        )
+        dashboard_thread = dashboard.run_in_background(dashboard_server)
+        logger.debug("[DASHBOARD] Started on port 8080")
+    except Exception as e:
+        logger.warning(f"[DASHBOARD] Failed to start: {e}")
     
     # Run playout engine in separate thread
     playout_thread = threading.Thread(target=playout_engine.run, daemon=True)
@@ -292,22 +266,31 @@ def start_station(config: RadioConfig) -> None:
             with open(pid_file, "r") as f:
                 stored_pid = f.read().strip()
             if stored_pid == str(pid_value):
-                logger.info(f"PID file written: {pid_file} (PID: {pid_value})")
+                logger.debug(f"[STATION] PID file: {pid_file} (PID: {pid_value})")
             else:
-                logger.warning(f"PID file mismatch: expected {pid_value}, got {stored_pid}")
+                logger.warning(f"[STATION] PID file mismatch: expected {pid_value}, got {stored_pid}")
         else:
-            logger.warning(f"PID file was not created: {pid_file}")
+            logger.warning(f"[STATION] PID file was not created: {pid_file}")
     except Exception as e:
-        logger.warning(f"Could not write PID file {pid_file}: {e}")
+        logger.warning(f"[STATION] Could not write PID file: {e}")
     
     try:
         # Run station in main thread
         station.run()
     finally:
-        # Cleanup (Phase 8 + Phase 9)
-        logger.info("Shutting down...")
+        # Cleanup
+        logger.info("[STATION] Shutting down")
         shutdown_event.set()
         playout_engine.stop()
+        
+        # Phase 6: Stop HTTP status server
+        if dashboard_server is not None:
+            try:
+                dashboard_server.shutdown()
+                if dashboard_thread:
+                    dashboard_thread.join(timeout=1.0)
+            except Exception as e:
+                logger.warning(f"[DASHBOARD] Error stopping: {e}")
         
         # Phase 9: Stop MasterClock first (stops frame delivery)
         master_clock.stop()
@@ -317,7 +300,7 @@ def start_station(config: RadioConfig) -> None:
             try:
                 sink.stop()
             except Exception as e:
-                logger.error(f"Error stopping sink: {e}")
+                logger.error(f"[STATION] Error stopping sink: {e}")
         
         # Wait for playout thread to finish
         playout_thread.join(timeout=2.0)
@@ -327,7 +310,7 @@ def start_station(config: RadioConfig) -> None:
             station.playlist_manager.save_state()
         except Exception as e:
             if config.debug:
-                logger.warning(f"Failed to save playlist state: {e}")
+                logger.warning(f"[STATION] Failed to save playlist state: {e}")
         
         # Remove PID file (only if it contains our PID)
         try:

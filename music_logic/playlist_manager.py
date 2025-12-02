@@ -84,12 +84,12 @@ class PlaylistManager:
             try:
                 files = [f for f in os.listdir(regular_path) if f.endswith('.mp3')]
                 self.play_counts = {f: 0 for f in files}
-                logger.info(f"Initialized {len(self.play_counts)} regular songs")
+                logger.debug(f"[LIBRARY] Initialized {len(self.play_counts)} regular songs")
             except OSError as e:
-                logger.error(f"Error reading regular music directory {regular_path}: {e}")
+                logger.error(f"[LIBRARY] Error reading regular directory: {e}")
                 self.play_counts = {}
         else:
-            logger.warning(f"Regular music path does not exist: {regular_path}")
+            logger.warning(f"[LIBRARY] Regular path does not exist: {regular_path}")
             self.play_counts = {}
         
         # Initialize holiday play counts
@@ -97,12 +97,12 @@ class PlaylistManager:
             try:
                 files = [f for f in os.listdir(holiday_path) if f.endswith('.mp3')]
                 self.holiday_play_counts = {f: 0 for f in files}
-                logger.info(f"Initialized {len(self.holiday_play_counts)} holiday songs")
+                logger.debug(f"[LIBRARY] Initialized {len(self.holiday_play_counts)} holiday songs")
             except OSError as e:
-                logger.error(f"Error reading holiday music directory {holiday_path}: {e}")
+                logger.error(f"[LIBRARY] Error reading holiday directory: {e}")
                 self.holiday_play_counts = {}
         else:
-            logger.warning(f"Holiday music path does not exist: {holiday_path}")
+            logger.warning(f"[LIBRARY] Holiday path does not exist: {holiday_path}")
             self.holiday_play_counts = {}
     
     def is_holiday_season(self) -> bool:
@@ -406,7 +406,7 @@ class PlaylistManager:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Saved playlist state to {self.state_file}")
         except Exception as e:
-            logger.warning(f"Failed to save playlist state: {e}")
+            logger.warning(f"[LIBRARY] Failed to save state: {e}")
     
     def load_state(self) -> bool:
         """
@@ -430,12 +430,9 @@ class PlaylistManager:
             self.play_counts = state.get("play_counts", {})
             self.holiday_play_counts = state.get("holiday_play_counts", {})
             
-            logger.info(
-                f"Loaded playlist state: {len(self.history)} history entries, "
-                f"{len(self.play_counts)} regular songs, {len(self.holiday_play_counts)} holiday songs"
-            )
+            logger.debug(f"[LIBRARY] Loaded state: {len(self.history)} history, {len(self.play_counts)} regular, {len(self.holiday_play_counts)} holiday")
             return True
         except Exception as e:
-            logger.warning(f"Failed to load playlist state: {e}")
+            logger.warning(f"[LIBRARY] Failed to load state: {e}")
             return False
 

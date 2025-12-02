@@ -1,95 +1,117 @@
 """
 Cadence manager for DJ segment timing.
 
-This module provides the CadenceManager class, which manages the counter
-for songs since last DJ talk and handles reset behavior.
+Phase 7: Implements spacing rules and probability ramp for DJ segments.
 """
 
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
 
 class CadenceManager:
     """
-    Manages timing and cadence for DJ segments.
+    Manages spacing and probability for DJ segments.
     
-    Tracks songs_since_last_dj_talk counter:
-    - Increments once per song
-    - Resets to 0 when DJ plays
-    - Used by RulesEngine for probability calculation
+    Rules:
+    - Minimum spacing: Never allow DJ segment if fewer than 3 songs since last segment
+    - Probability ramp: Base 20% at 3 songs, linearly increases to 85% at 8+ songs
     """
     
-    def __init__(self) -> None:
-        """Initialize the cadence manager."""
-        self.songs_since_last_dj_talk: int = 0
-    
-    def increment(self) -> None:
+    def __init__(
+        self,
+        min_songs_between_segments: int = 3,
+        base_probability: float = 0.20,
+        max_probability: float = 0.85,
+        max_probability_at_songs: int = 8,
+    ) -> None:
         """
-        Increment the counter (call once per song).
+        Initialize the cadence manager.
         
-        This should be called after each song, regardless of whether
-        DJ segments were played or not.
+        Args:
+            min_songs_between_segments: Minimum songs required between segments (default: 3)
+            base_probability: Base probability when minimum is met (default: 0.20 = 20%)
+            max_probability: Maximum probability after ramp (default: 0.85 = 85%)
+            max_probability_at_songs: Songs at which max probability is reached (default: 8)
         """
-        self.songs_since_last_dj_talk += 1
-        logger.debug(f"Songs since last DJ talk: {self.songs_since_last_dj_talk}")
+        self._songs_since_last_segment = 0
+        self._min_songs = min_songs_between_segments
+        self._base_p = base_probability
+        self._max_p = max_probability
+        self._max_at = max_probability_at_songs
+        self._lock = threading.Lock()
     
-    def reset(self) -> None:
+    def register_song_played(self) -> None:
         """
-        Reset the counter to 0 (call when DJ segment is played).
+        Register that a song was played.
         
-        This should be called when a DJ intro or outro is actually played.
+        Call this once per song, regardless of whether a DJ segment was played.
         """
-        if self.songs_since_last_dj_talk > 0:
-            logger.debug(f"Resetting DJ counter (was {self.songs_since_last_dj_talk})")
-        self.songs_since_last_dj_talk = 0
+        with self._lock:
+            self._songs_since_last_segment += 1
+            logger.debug(f"[Cadence] Songs since last segment: {self._songs_since_last_segment}")
     
-    def get_count(self) -> int:
+    def register_segment_played(self) -> None:
         """
-        Get current count of songs since last DJ talk.
+        Register that a DJ segment was played.
+        
+        Call this only when a DJ segment is actually added to the event queue.
+        """
+        with self._lock:
+            if self._songs_since_last_segment > 0:
+                logger.debug(f"[Cadence] Segment played, resetting counter (was {self._songs_since_last_segment})")
+            self._songs_since_last_segment = 0
+    
+    def can_play_segment(self) -> bool:
+        """
+        Check if enough songs have passed to allow a DJ segment.
+        
+        Returns:
+            True if minimum spacing requirement is met, False otherwise
+        """
+        with self._lock:
+            n = self._songs_since_last_segment
+            can_play = n >= self._min_songs
+            if not can_play:
+                logger.debug(f"[Cadence] Blocked: only {n} songs since last segment (need {self._min_songs})")
+            return can_play
+    
+    def speaking_probability(self) -> float:
+        """
+        Calculate the probability of speaking based on songs since last segment.
+        
+        Probability ramp:
+        - 0-2 songs: 0.0 (blocked by minimum spacing)
+        - 3 songs: base_probability (20%)
+        - 4-7 songs: Linear increase from base to max
+        - 8+ songs: max_probability (85%)
+        
+        Returns:
+            Probability (0.0 to 1.0)
+        """
+        with self._lock:
+            n = self._songs_since_last_segment
+        
+        if n < self._min_songs:
+            return 0.0
+        
+        if n >= self._max_at:
+            return self._max_p
+        
+        # Linear ramp between base and max
+        span = self._max_at - self._min_songs
+        factor = (n - self._min_songs) / span
+        probability = self._base_p + factor * (self._max_p - self._base_p)
+        
+        return probability
+    
+    def get_songs_since_last_segment(self) -> int:
+        """
+        Get current count of songs since last segment (for debugging/logging).
         
         Returns:
             Number of songs since last DJ segment
         """
-        return self.songs_since_last_dj_talk
-    
-    def can_play_segment(self, songs_since_dj: int, min_songs_between: int = 3) -> bool:
-        """
-        Check if enough songs have passed to allow a DJ segment.
-        
-        Args:
-            songs_since_dj: Number of songs since last DJ segment
-            min_songs_between: Minimum songs required between segments
-            
-        Returns:
-            True if segment can play, False otherwise
-        """
-        return songs_since_dj >= min_songs_between
-    
-    def should_prefer_intro_over_outro(self, song_path: str) -> bool:
-        """
-        Determine if intro should be preferred over outro for a song.
-        
-        Phase 6: Always prefers intro (matches legacy behavior).
-        Future phases can add logic based on song attributes.
-        
-        Args:
-            song_path: Path to the song file
-            
-        Returns:
-            True if intro should be preferred, False if outro preferred
-        """
-        # Legacy behavior: intro always has priority
-        return True
-    
-    def get_time_since_last_dj(self) -> None:
-        """
-        Get time (in seconds) since last DJ segment.
-        
-        Phase 6: Not implemented (uses song count instead).
-        Future phases can track timestamps.
-        
-        Returns:
-            None (not implemented in Phase 6)
-        """
-        return None
+        with self._lock:
+            return self._songs_since_last_segment

@@ -79,6 +79,7 @@ class YouTubeSink(SinkBase):
         self._process: Optional[subprocess.Popen] = None
         self._process_lock = threading.Lock()
         self._is_connected = False
+        self._disconnected = False  # Phase 4: Track if YouTube is disconnected (non-fatal)
         
         # Frame counter
         self._frames_written = 0
@@ -128,6 +129,9 @@ class YouTubeSink(SinkBase):
         """
         Write a PCM frame to the YouTube sink (O(1), non-blocking).
         
+        Phase 4: Non-fatal - if this throws, it's logged as WARNING and YouTube is marked disconnected.
+        FM continues playing uninterrupted.
+        
         Enqueues frame into buffer. Worker thread writes frames to FFmpeg
         at real-time rate. No I/O performed here.
         
@@ -137,26 +141,36 @@ class YouTubeSink(SinkBase):
         if not self._running:
             return
         
-        # Enqueue frame (drop oldest if queue full)
-        with self._queue_lock:
-            if len(self._queue) >= self._max_queue_size:
-                # Drop oldest frame to avoid unbounded growth
-                self._queue.popleft()
-            self._queue.append(pcm_frame)
+        # Phase 4: If disconnected, silently drop frames (non-fatal)
+        if self._disconnected:
+            return
+        
+        try:
+            # Enqueue frame (drop oldest if queue full)
+            with self._queue_lock:
+                if len(self._queue) >= self._max_queue_size:
+                    # Drop oldest frame to avoid unbounded growth
+                    self._queue.popleft()
+                self._queue.append(pcm_frame)
+        except Exception as e:
+            # Phase 4: Non-fatal error - log as WARNING, mark disconnected
+            logger.warning(f"[YouTubeSink] write_frame error (non-critical): {e}")
+            self._disconnected = True
+            # Do not raise - allow FM to continue
     
     def _drain_loop(self) -> None:
         """
         Worker thread that paces writes to FFmpeg at real-time rate.
-        
+
         Writes exactly one frame per tick_interval to maintain continuous
         audio stream. Handles reconnection if FFmpeg dies.
         """
         if self.debug:
             logger.debug("[YouTubeSink] Worker thread started")
-        
+
         flush_counter = 0
         next_write_time = None
-        
+
         while self._running:
             try:
                 # Ensure FFmpeg is running
@@ -165,7 +179,7 @@ class YouTubeSink(SinkBase):
                         time.sleep(self.reconnect_delay)
                     next_write_time = None  # Reset timing on reconnect
                     continue
-                
+
                 # Initialize timing on first iteration
                 now = time.monotonic()
                 if next_write_time is None:
@@ -192,35 +206,41 @@ class YouTubeSink(SinkBase):
                     with self._process_lock:
                         if self._process is None or self._process.poll() is not None:
                             continue
-                        
+
                         if self._process.stdin and not self._process.stdin.closed:
-                            self._process.stdin.write(frame)
-                            self._frames_written += 1
-                            flush_counter += 1
-                            
-                            if flush_counter >= 16:
-                                self._process.stdin.flush()
-                                flush_counter = 0
-                            
-                            if not self._is_connected:
-                                if self.debug:
-                                    logger.info("YouTube stream connected")
+                                self._process.stdin.write(frame)
+                                self._frames_written += 1
+                                flush_counter += 1
+
+                                if flush_counter >= 16:
+                                    self._process.stdin.flush()
+                                    flush_counter = 0
+
+                                if not self._is_connected:
+                                    if self.debug:
+                                        logger.info("YouTube stream connected")
                                     logger.info(
                                         "[YouTubeSink] First frame written to FFmpeg: %d bytes",
                                         len(frame)
                                     )
-                            self._is_connected = True
-                
+                                    self._is_connected = True
+
                 except BrokenPipeError:
-                    logger.warning("[YouTubeSink] Broken pipe, will restart on next loop")
+                    # Phase 4: Non-fatal - mark disconnected, attempt reconnection
+                    logger.warning("[YouTubeSink] Broken pipe (non-critical), marking disconnected")
                     self._is_connected = False
+                    self._disconnected = True
                     next_write_time = None  # Reset timing on error
+                    # Reconnection will be attempted in _ensure_ffmpeg_running()
                 except BlockingIOError:
                     # FFmpeg backpressure - don't advance timing, retry next iteration
                     # This prevents buffer growth when FFmpeg is slow
                     next_write_time = time.monotonic()  # Reset to now to retry immediately
-                except Exception:
-                    logger.exception("[YouTubeSink] worker write error")
+                except Exception as e:
+                    # Phase 4: Non-fatal - log as WARNING, mark disconnected
+                    logger.warning(f"[YouTubeSink] worker write error (non-critical): {e}")
+                    self._is_connected = False
+                    self._disconnected = True
                     next_write_time = None  # Reset timing on error
                 
                 # Periodic logging (every ~5 seconds, only if debug enabled)
@@ -235,18 +255,23 @@ class YouTubeSink(SinkBase):
                             self._frames_written
                         )
                         self._last_log_time = log_now
-            
+
             except Exception as e:
-                logger.error(f"[YouTubeSink] drain_loop error: {e}", exc_info=True)
+                # Phase 4: Non-fatal - log as WARNING, mark disconnected
+                logger.warning(f"[YouTubeSink] drain_loop error (non-critical): {e}")
+                self._disconnected = True
+                self._is_connected = False
                 next_write_time = None  # Reset timing on exception
                 time.sleep(0.1)
         
         if self.debug:
             logger.debug("[YouTubeSink] Worker thread stopped")
-    
+
     def _ensure_ffmpeg_running(self) -> bool:
         """
         Ensure FFmpeg process is running. Start if needed.
+        
+        Phase 4: Attempts reconnection if disconnected. Non-fatal - returns False on failure.
         
         Returns:
             True if FFmpeg is running, False otherwise
@@ -255,13 +280,25 @@ class YouTubeSink(SinkBase):
             # Check if process exists and is alive
             if self._process is not None:
                 if self._process.poll() is None:
-                    # Process is running
+                    # Process is running - if we were disconnected, mark as reconnected
+                    if self._disconnected:
+                        logger.info("[YouTubeSink] Reconnected to YouTube stream")
+                        self._disconnected = False
                     return True
                 # Process died - close it
                 self._close_ffmpeg_process()
             
-            # Process doesn't exist or died - start it
-            return self._start_ffmpeg_process()
+            # Process doesn't exist or died - attempt to start it
+            if self._start_ffmpeg_process():
+                # Successfully started - mark as reconnected
+                if self._disconnected:
+                    logger.info("[YouTubeSink] Reconnected to YouTube stream")
+                    self._disconnected = False
+                return True
+            else:
+                # Failed to start - mark as disconnected (non-fatal)
+                self._disconnected = True
+                return False
     
     def _start_ffmpeg_process(self) -> bool:
         """
@@ -347,35 +384,35 @@ class YouTubeSink(SinkBase):
                 # Calculate GOP for <= 4 second keyframe interval (YouTube requirement)
                 max_keyframe_seconds = 4
                 gop_size = self.video_fps * max_keyframe_seconds
-                
-                # Calculate buffer size
-                try:
-                    bitrate_str = self.video_bitrate.rstrip('kKmM')
-                    bitrate_num = int(bitrate_str)
-                    bitrate_unit = self.video_bitrate[-1].lower() if self.video_bitrate[-1] in 'kKmM' else 'k'
-                    buffer_num = bitrate_num * 2
-                    buffer_size = f"{buffer_num}{bitrate_unit}"
-                except (ValueError, IndexError):
-                    buffer_size = "8000k"
-                
-                cmd.extend([
-                    "-c:a", "aac",
+            
+            # Calculate buffer size
+            try:
+                bitrate_str = self.video_bitrate.rstrip('kKmM')
+                bitrate_num = int(bitrate_str)
+                bitrate_unit = self.video_bitrate[-1].lower() if self.video_bitrate[-1] in 'kKmM' else 'k'
+                buffer_num = bitrate_num * 2
+                buffer_size = f"{buffer_num}{bitrate_unit}"
+            except (ValueError, IndexError):
+                buffer_size = "8000k"
+            
+            cmd.extend([
+                "-c:a", "aac",
                     "-b:a", "160k",
-                    "-c:v", "libx264",
+                "-c:v", "libx264",
                     "-preset", "ultrafast",
-                    "-pix_fmt", "yuv420p",
-                    "-b:v", self.video_bitrate,
-                    "-maxrate", self.video_bitrate,
-                    "-bufsize", buffer_size,
-                    "-g", str(gop_size),
-                    "-keyint_min", str(self.video_fps),
-                    "-sc_threshold", "0",
+                "-pix_fmt", "yuv420p",
+                "-b:v", self.video_bitrate,
+                "-maxrate", self.video_bitrate,
+                "-bufsize", buffer_size,
+                "-g", str(gop_size),
+                "-keyint_min", str(self.video_fps),
+                "-sc_threshold", "0",
                     "-fflags", "nobuffer",
                     "-flags", "low_delay",
-                ])
-                
-                if self.video_source == "image":
-                    cmd.extend(["-vf", f"scale={self.video_size}"])
+            ])
+            
+            if self.video_source == "image":
+                cmd.extend(["-vf", f"scale={self.video_size}"])
             
             # Output format
             cmd.extend([
@@ -479,3 +516,55 @@ class YouTubeSink(SinkBase):
     def is_connected(self) -> bool:
         """Check if YouTube stream is currently connected."""
         return self._is_connected and self._running
+    
+    def try_reconnect(self) -> bool:
+        """
+        Phase 4: Attempt to reconnect YouTube stream if disconnected.
+        
+        Non-fatal - returns False on failure, but does not raise.
+        Can be called periodically from main loop or timer.
+        
+        Returns:
+            True if reconnected, False otherwise
+        """
+        if not self._disconnected:
+            # Already connected
+            return True
+        
+        logger.info("[YouTubeSink] Attempting to reconnect...")
+        return self._ensure_ffmpeg_running()
+    
+    def is_disconnected(self) -> bool:
+        """
+        Phase 4: Check if YouTube is currently disconnected.
+        
+        Returns:
+            True if disconnected, False if connected
+        """
+        return self._disconnected
+    
+    def try_reconnect(self) -> bool:
+        """
+        Phase 4: Attempt to reconnect YouTube stream if disconnected.
+        
+        Non-fatal - returns False on failure, but does not raise.
+        Can be called periodically from main loop or timer.
+        
+        Returns:
+            True if reconnected, False otherwise
+        """
+        if not self._disconnected:
+            # Already connected
+            return True
+        
+        logger.info("[YouTubeSink] Attempting to reconnect...")
+        return self._ensure_ffmpeg_running()
+    
+    def is_disconnected(self) -> bool:
+        """
+        Phase 4: Check if YouTube is currently disconnected.
+        
+        Returns:
+            True if disconnected, False if connected
+        """
+        return self._disconnected
