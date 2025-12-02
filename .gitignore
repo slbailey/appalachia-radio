@@ -12,3 +12,4 @@ logs/
 .vscode/
 PotentialIssues.txt
 QuarantinedFiles.txt
+*.pid
