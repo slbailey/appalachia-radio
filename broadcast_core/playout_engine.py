@@ -70,6 +70,7 @@ callback recursion. Violations will cause the radio to freeze.
 
 import logging
 import os
+import subprocess
 import threading
 import queue
 from dataclasses import dataclass
@@ -80,6 +81,33 @@ from broadcast_core.state_machine import PlaybackState, StateMachine
 from broadcast_core.playlog import Playlog, PlaylogEntry
 
 logger = logging.getLogger(__name__)
+
+
+def _get_audio_duration(file_path: str) -> Optional[float]:
+    """
+    Get the duration of an audio file in seconds using ffprobe.
+    
+    Returns None if ffprobe fails or file doesn't exist.
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path
+        ]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=2.0
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        pass
+    return None
 
 
 @dataclass
@@ -208,6 +236,9 @@ class PlayoutEngine:
         self._current_sequence_index_A: int = 0  # Index into sequence (0=preroll/main, 1=postroll)
         self._current_sequence_B: Optional[List[AudioEvent]] = None
         self._current_sequence_index_B: int = 0
+        
+        # Temporary: Track start times for intro/outro events to log duration
+        self._event_start_times: dict[str, datetime] = {}  # key: event.path, value: start time
         
         # Set up event completion callback
         self.mixer.set_event_complete_callback(self._on_event_complete)
@@ -527,6 +558,13 @@ class PlayoutEngine:
                                             )
                                         
                                         logger.info(f"[PLAYOUT] Start deck A: {os.path.basename(first_event.path)}")
+                                        
+                                        # Temporary: Log intro/outro start with duration
+                                        if first_event.type in ("intro", "outro"):
+                                            duration = _get_audio_duration(first_event.path)
+                                            duration_str = f" (duration: {duration:.2f}s)" if duration else ""
+                                            logger.info(f"[TEMP] {first_event.type.upper()} START: {os.path.basename(first_event.path)}{duration_str}")
+                                            self._event_start_times[first_event.path] = datetime.now()
                     
                                         # 3. Emit song_started event (after start_event)
                                         # Note: mixer.start_event() already fires song_started callback via _on_mixer_song_started
@@ -596,6 +634,14 @@ class PlayoutEngine:
             deck: Which deck finished (optional, will try to detect if not provided)
         """
         logger.debug(f"[PLAYOUT] Completed {os.path.basename(event.path) if event.path else 'unknown'} on deck {deck or 'unknown'}")
+        
+        # Temporary: Log intro/outro finish with actual playback duration
+        if event.type in ("intro", "outro") and event.path in self._event_start_times:
+            start_time = self._event_start_times.pop(event.path)
+            actual_duration = (datetime.now() - start_time).total_seconds()
+            file_duration = _get_audio_duration(event.path)
+            file_duration_str = f" (file duration: {file_duration:.2f}s)" if file_duration else ""
+            logger.info(f"[TEMP] {event.type.upper()} FINISH: {os.path.basename(event.path)} (played: {actual_duration:.2f}s){file_duration_str}")
         
         # Detect deck if not provided
         if deck is None:
@@ -670,6 +716,13 @@ class PlayoutEngine:
                 
                 logger.info(f"[PLAYOUT] Start deck {deck}: {os.path.basename(next_event.path)}")
                 
+                # Temporary: Log intro/outro start with duration
+                if next_event.type in ("intro", "outro"):
+                    duration = _get_audio_duration(next_event.path)
+                    duration_str = f" (duration: {duration:.2f}s)" if duration else ""
+                    logger.info(f"[TEMP] {next_event.type.upper()} START: {os.path.basename(next_event.path)}{duration_str}")
+                    self._event_start_times[next_event.path] = datetime.now()
+                
                 # Call event start callbacks
                 for callback in self._event_start_callbacks:
                     try:
@@ -718,6 +771,13 @@ class PlayoutEngine:
                         )
                     
                     logger.info(f"[PLAYOUT] Start deck {deck}: {os.path.basename(next_event.path)}")
+                    
+                    # Temporary: Log intro/outro start with duration
+                    if next_event.type in ("intro", "outro"):
+                        duration = _get_audio_duration(next_event.path)
+                        duration_str = f" (duration: {duration:.2f}s)" if duration else ""
+                        logger.info(f"[TEMP] {next_event.type.upper()} START: {os.path.basename(next_event.path)}{duration_str}")
+                        self._event_start_times[next_event.path] = datetime.now()
                     
                     # Call event start callbacks
                     for callback in self._event_start_callbacks:
@@ -784,6 +844,13 @@ class PlayoutEngine:
                             )
                         
                         logger.info(f"[PLAYOUT] Start deck {new_active}: {os.path.basename(next_event.path)}")
+                        
+                        # Temporary: Log intro/outro start with duration
+                        if next_event.type in ("intro", "outro"):
+                            duration = _get_audio_duration(next_event.path)
+                            duration_str = f" (duration: {duration:.2f}s)" if duration else ""
+                            logger.info(f"[TEMP] {next_event.type.upper()} START: {os.path.basename(next_event.path)}{duration_str}")
+                            self._event_start_times[next_event.path] = datetime.now()
                         
                         # Call event start callbacks
                         for callback in self._event_start_callbacks:
@@ -854,6 +921,13 @@ class PlayoutEngine:
                     
                     logger.info(f"[PLAYOUT] Start deck {new_active}: {os.path.basename(next_event.path)}")
                     
+                    # Temporary: Log intro/outro start with duration
+                    if next_event.type in ("intro", "outro"):
+                        duration = _get_audio_duration(next_event.path)
+                        duration_str = f" (duration: {duration:.2f}s)" if duration else ""
+                        logger.info(f"[TEMP] {next_event.type.upper()} START: {os.path.basename(next_event.path)}{duration_str}")
+                        self._event_start_times[next_event.path] = datetime.now()
+                    
                     # Call event start callbacks
                     for callback in self._event_start_callbacks:
                         try:
@@ -898,6 +972,13 @@ class PlayoutEngine:
                     )
                 
                 logger.info(f"[PLAYOUT] Start deck {new_active}: {os.path.basename(next_event.path)}")
+                
+                # Temporary: Log intro/outro start with duration
+                if next_event.type in ("intro", "outro"):
+                    duration = _get_audio_duration(next_event.path)
+                    duration_str = f" (duration: {duration:.2f}s)" if duration else ""
+                    logger.info(f"[TEMP] {next_event.type.upper()} START: {os.path.basename(next_event.path)}{duration_str}")
+                    self._event_start_times[next_event.path] = datetime.now()
         
         # Update state to IDLE only if queue is empty and mixer is truly idle
         if self.event_queue.empty() and not self.mixer.is_playing():

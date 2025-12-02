@@ -68,7 +68,9 @@ class AudioDecoder:
         # Build FFmpeg command
         cmd = [
             "ffmpeg",
+            "-fflags", "+bitexact",
             "-i", event.path,
+            "-af", "aresample=async=1:min_comp=0.001:first_pts=0",
             "-f", "s16le",
             "-ac", str(self.channels),
             "-ar", str(self.sample_rate),
@@ -157,34 +159,18 @@ class AudioDecoder:
             # Keep _current_event so mixer can retrieve it before closing
             return None
         
-        # Use select with zero timeout for truly non-blocking read
-        # Clock tick must not block - if data not ready, return empty and try next tick
-        
-        # Zero timeout = non-blocking check only
-        ready, _, _ = select.select([self._process.stdout], [], [], 0.0)
-        
-        if not ready:
-            # No data available yet - return empty bytes to indicate "not ready"
-            # Mixer will use buffer or silence, but won't treat as EOF
-            return b''
-        
-        # Data available - read frame_size bytes (non-blocking)
-        # Since stdout is non-blocking, read will return available data immediately
+        # Read frame using stdout.read() - simpler and more reliable for MP3/TTS
         try:
-            frame = os.read(self._process.stdout.fileno(), self.frame_size)
-        except BlockingIOError:
-            # Shouldn't happen if select() said ready, but handle it
-            return b''
-        except OSError:
-            # Process may have closed stdout
+            frame = self._process.stdout.read(self.frame_size)
+        except Exception:
+            frame = b''
+        
+        if not frame:
+            # If the process ended AND we've drained stdout → true EOF
             if self._process.poll() is not None:
-                # Store event path before clearing
-                event_path = self._current_event.path if self._current_event else "unknown"
-                frame_count = self._frame_count
-                logger.debug(f"[DECODER] EOF: {os.path.basename(event_path)} ({frame_count} frames)")
-                # Don't close here - let mixer handle it so it can get the event first
                 self._process = None
                 return None
+            # No data yet → not EOF
             return b''
         
         if not frame:

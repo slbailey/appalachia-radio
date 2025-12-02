@@ -120,14 +120,18 @@ class AudioMixer:
         # This allows existing code that references self.decoder to still work
         self.decoder = self.turntable_a
         
-        # Small buffer (max 10 frames) for smoothing - feeds active deck output
-        self._frame_buffer: deque[bytes] = deque(maxlen=10)
+        # Small buffer (max 50 frames) for smoothing - feeds active deck output
+        self._frame_buffer: deque[bytes] = deque(maxlen=50)
         self._buffer_lock = threading.Lock()
         
         # Pre-buffer for inactive deck (stores frames while pre-loading)
         # When we switch decks, these frames are available immediately
         self._inactive_deck_buffer: deque[bytes] = deque(maxlen=100)  # Larger buffer for pre-loading
         self._inactive_buffer_lock = threading.Lock()
+        
+        # Track pending event completion - callback fires only after buffer drains
+        self._pending_completed_event = None
+        self._pending_completed_deck = None
         
         # Warm-start buffer threshold
         self._min_buffer_frames = 10
@@ -379,10 +383,8 @@ class AudioMixer:
             frame_index: Current frame index from MasterClock
         """
         frame = None
-        completed_event = None
-        completed_deck = None
         
-        # Step 1: Detect EOF inside lock, store event/deck info, release lock
+        # Step 1: Detect EOF inside lock, store pending completion info, release lock
         with self._decoder_lock:
             active_decoder = self._get_active_decoder()
             inactive_decoder = self._get_inactive_decoder()
@@ -399,18 +401,18 @@ class AudioMixer:
                     if not active_decoder.is_active() and active_decoder.has_event():
                         # Actual EOF - active deck finished
                         # Get event BEFORE closing (close() clears _current_event)
-                        completed_event = active_decoder.get_current_event()
-                        completed_deck = self.active_deck  # Store deck before switch
+                        pending_event = active_decoder.get_current_event()
+                        pending_deck = self.active_deck  # Store deck before switch
                         
                         # Only proceed if we have a valid event
-                        if completed_event:
+                        if pending_event:
                             active_decoder.close()
+                            # Store as pending - callback will fire after buffer drains
+                            self._pending_completed_event = pending_event
+                            self._pending_completed_deck = pending_deck
                         else:
                             # No event - decoder was already closed or never had an event
                             logger.warning(f"[MIXER] Deck {self.active_deck} finished but no event found")
-                            # Don't set completed_event - skip callback
-                            completed_event = None
-                            completed_deck = None
                         
                         # Active deck finished - mark for completion callback
                         # NOTE: We do NOT switch decks here - that's handled by PlayoutEngine
@@ -418,7 +420,7 @@ class AudioMixer:
                         # The inactive deck has event metadata pre-loaded but FFmpeg hasn't started yet
                         if inactive_decoder.has_event():
                             new_active = "B" if self.active_deck == "A" else "A"
-                            logger.debug(f"[MIXER] Deck {completed_deck} finished, deck {new_active} preloaded")
+                            logger.debug(f"[MIXER] Deck {pending_deck} finished, deck {new_active} preloaded")
                     # If decoder is still active but returned None, it's just not ready yet
                     # (shouldn't happen, but handle it)
                     elif active_decoder.is_active():
@@ -433,7 +435,64 @@ class AudioMixer:
             # Preload is metadata-only - no decoding, no buffering, no FFmpeg process
             # FFmpeg only starts when start_event() is called (when deck becomes active)
         
+        # Get frame from buffer or use decoded frame
+        completed_event = None
+        completed_deck = None
+        
+        with self._buffer_lock:
+            if frame:
+                # Add to buffer (max 10 frames)
+                if len(self._frame_buffer) >= 10:
+                    # Buffer full - drop oldest
+                    self._frame_buffer.popleft()
+                self._frame_buffer.append(frame)
+                self._last_data_time = time.monotonic()
+                
+                # First valid PCM frame received - mixer is now ready
+                if not self.ready:
+                    self.ready = True
+                    logger.debug("[MIXER] First PCM frame received")
+                
+                # Check if buffer has reached warm-start threshold
+                if not self._buffer_ready and len(self._frame_buffer) >= self._min_buffer_frames:
+                    self._buffer_ready = True
+                    logger.debug("[MIXER] Buffer warmed")
+            
+            # Check if we should deliver frames (only if buffer is warmed)
+            if self._buffer_ready:
+                # Buffer is warmed - deliver frames normally
+                if len(self._frame_buffer) > 0:
+                    deliver_frame = self._frame_buffer.popleft()
+                elif frame:
+                    deliver_frame = frame
+                else:
+                    # No frame available – treat as underrun once buffer is warm
+                    if frame_index != self._last_underrun_log_index + 1:
+                        logger.warning(f"[MIXER] Buffer underrun (frame {frame_index})")
+                    self._last_underrun_log_index = frame_index
+                    
+                    # Generate silence frame only if we've had no data for >500ms
+                    if self._last_data_time is None or (time.monotonic() - self._last_data_time) > 0.5:
+                        deliver_frame = bytes(self.frame_size)
+                    else:
+                        deliver_frame = None
+            else:
+                # Buffer not warmed yet - don't deliver frames, just accumulate
+                self._warming_ticks += 1
+                deliver_frame = None
+            
+            # Check if event completion should fire now (after buffer has drained)
+            # buffer_size here reflects size AFTER popping a frame (if we did so)
+            # On the tick where we deliver the very last buffered frame, buffer_size will be 0
+            buffer_size = len(self._frame_buffer)
+            if self._pending_completed_event and buffer_size == 0:
+                completed_event = self._pending_completed_event
+                completed_deck = self._pending_completed_deck
+                self._pending_completed_event = None
+                self._pending_completed_deck = None
+        
         # Step 2: NOW outside all locks - invoke callback if event completed
+        # This fires only after all buffered frames have been delivered
         if completed_event:
             logger.debug(f"[MIXER] Invoking event complete callback for deck {completed_deck}")
             logger.info(f"[MIXER] EOF deck {completed_deck}: {os.path.basename(completed_event.path)}")
@@ -457,54 +516,6 @@ class AudioMixer:
                     logger.error(f"[MIXER] Event complete callback error: {e}", exc_info=True)
             else:
                 logger.warning(f"[MIXER] No completion callback registered")
-        elif completed_deck is not None:
-            # We detected EOF but couldn't get the event - this shouldn't happen
-            logger.warning(f"[MIXER] Deck {completed_deck} finished but no event available")
-        
-        # Get frame from buffer or use decoded frame
-        with self._buffer_lock:
-            if frame:
-                # Add to buffer (max 10 frames)
-                if len(self._frame_buffer) >= 10:
-                    # Buffer full - drop oldest
-                    self._frame_buffer.popleft()
-                self._frame_buffer.append(frame)
-                self._last_data_time = time.monotonic()
-                
-                # First valid PCM frame received - mixer is now ready
-                if not self.ready:
-                    self.ready = True
-                    logger.debug("[MIXER] First PCM frame received")
-                
-                # Check if buffer has reached warm-start threshold
-                if not self._buffer_ready and len(self._frame_buffer) >= self._min_buffer_frames:
-                    self._buffer_ready = True
-                    logger.debug("[MIXER] Buffer warmed")
-            
-            # Check if we should deliver frames (only if buffer is warmed)
-            buffer_size = len(self._frame_buffer)
-            
-            if self._buffer_ready:
-                # Buffer is warmed - deliver frames normally
-                if buffer_size > 0:
-                    deliver_frame = self._frame_buffer.popleft()
-                elif frame:
-                    deliver_frame = frame
-                else:
-                    # No frame available – treat as underrun once buffer is warm
-                    if frame_index != self._last_underrun_log_index + 1:
-                        logger.warning(f"[MIXER] Buffer underrun (frame {frame_index})")
-                    self._last_underrun_log_index = frame_index
-                    
-                    # Generate silence frame only if we've had no data for >500ms
-                    if self._last_data_time is None or (time.monotonic() - self._last_data_time) > 0.5:
-                        deliver_frame = bytes(self.frame_size)
-                    else:
-                        deliver_frame = None
-            else:
-                # Buffer not warmed yet - don't deliver frames, just accumulate
-                self._warming_ticks += 1
-                deliver_frame = None
         
         # Deliver frame to all sinks (synchronized by clock)
         # Only write to sinks if mixer is ready AND buffer is warmed
